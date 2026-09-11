@@ -2,7 +2,7 @@ const {z} = require('zod')
 
 const createAddressSchema = z.object({
     fullName:z.string().trim().min(2, 'Name must be at least 2 characters'),
-    phone: z.string().trim().regex(/^\d{10}$/, 'Pincode must be 10 digits'),
+    phone: z.string().trim().regex(/^\d{10}$/, 'Phone must be 10 digits'),
     line1: z.string().trim().min(3, 'Address line is required'),
     line2: z.string().trim().optional(),
     city: z.string().trim().min(2, 'City is required'),
