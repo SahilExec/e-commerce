@@ -23,6 +23,8 @@ enum PaymentStatus {
   PENDING
   CAPTURED
   FAILED
+  REFUND_INITIATED
+  REFUNDED
 }
 
 model User {
@@ -97,7 +99,7 @@ model OrderItem {
 model Payment {
   id                String        @id @default(uuid())
   orderId           String        @unique
-  razorpayOrderId   String?
+  razorpayOrderId   String?       @unique
   razorpayPaymentId String?
   amount            Decimal       @db.Decimal(12, 2)
   status            PaymentStatus @default(PENDING)
