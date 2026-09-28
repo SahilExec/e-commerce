@@ -18,8 +18,11 @@ A production-grade, scalable e-commerce REST API built with Node.js, Express, Po
 - [API Reference](#-api-reference)
   - [Auth Module](#auth-module)
   - [Cart Module](#cart-module)
+  - [Address Module](#address-module)
   - [Product Module](#product-module)
   - [Category Module](#category-module)
+  - [Orders Module](#orders-module)
+  - [Payments Module](#payments-module)
 - [Function & Middleware Reference](#-function--middleware-reference)
 - [Rate Limiting](#-rate-limiting)
 - [Response Caching](#-response-caching)
@@ -71,6 +74,14 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - One Mongo `$in` query for the whole cart (no N+1 `findById` loop)
 - Empty cart is `200` with `items: []`, not 404 — a missing basket is a normal state
 
+### Orders & Payments
+- Saved **addresses** in PostgreSQL — one default per user (partial unique index + `P2002` / `FOR UPDATE`-style app handling)
+- **Checkout** copies Redis cart → Order + OrderItems + Payment (`PENDING`), snapshots name/price/address
+- Mongo stock decremented with `quantity: { $gte: qty }` + `$inc`; rollback if Prisma/Razorpay fails
+- **Razorpay** order created at checkout (`amount` in paise, `Math.round`); webhook HMAC on **raw body**; Checkout `order_id|payment_id` HMAC on `/payments/verify`
+- Shared **`capturePayment`** — idempotent `PENDING` → `PAID` / `CAPTURED`
+- **Cancel PENDING** restores stock; **cancel PAID** starts refund, stock returns on `refund.processed`
+
 ### Product Catalog
 - **Flexible product attributes** — key-value pair system handles any product type (phones have RAM/storage, clothing has size/color)
 - **Hierarchical category system** — self-referencing categories with parent-child relationships
@@ -110,7 +121,7 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 | Layer | Technology | Purpose |
 |-------|-----------|---------|
 | Runtime | Node.js + Express.js | HTTP server and routing |
-| Primary DB | PostgreSQL + Prisma ORM | Users, refresh tokens (relational, ACID) |
+| Primary DB | PostgreSQL + Prisma ORM | Users, refresh tokens, addresses, orders, payments |
 | Document DB | MongoDB + Mongoose | Product catalog, categories (flexible schema) |
 | Cache / Cart / OTP | Redis (`redis` + `rate-limit-redis`) | Cart, OTP, blacklist, rate limits, GET response cache, stampede locks |
 | Authentication | JWT + bcrypt | Stateless auth with secure password storage |
@@ -119,6 +130,7 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 | Rate Limiting | express-rate-limit | Per-route limits with Redis store |
 | File Upload | Multer + Cloudinary | Image handling and CDN delivery |
 | Fake Data | @faker-js/faker | Realistic seed data generation |
+| Payments | Razorpay | Orders, Checkout verify, webhooks, refunds |
 
 ---
 
@@ -167,7 +179,7 @@ Hard deleting a category that has historical products would break referential in
 Mongoose's `pre('save')` hook only fires on `.save()`, not on `findByIdAndUpdate()` — which this project uses for all updates. Relying on the hook silently fails to regenerate slugs on update. Calling a shared `slugify()` utility explicitly in both `createProduct`/`createCategory` and `updateProduct`/`updateCategory` removes this hidden inconsistency.
 
 **Why Redis for the cart, not Mongo/Postgres?**
-A cart is a shopping basket: written often, allowed to vanish, and not money. Redis hashes give O(1) add/remove of a single product without rewriting the whole document, plus TTL so abandoned carts disappear without a cron job. Orders (Week 5) will live in PostgreSQL because money cannot vanish.
+A cart is a shopping basket: written often, allowed to vanish, and not money. Redis hashes give O(1) add/remove of a single product without rewriting the whole document, plus TTL so abandoned carts disappear without a cron job. Orders live in PostgreSQL because money cannot vanish.
 
 **Why a Redis hash, not one JSON string?**
 A JSON blob is a read-modify-write on every change — two tabs can overwrite each other. `HINCRBY` is atomic: field missing → create at N; field exists → add N.
@@ -220,6 +232,36 @@ Express `next()` does not wait for the controller. `await next()` then `releaseL
 **Why not cache-key versioning?**
 Versioning puts `v5` in the key and invalidates by bumping `v` — old keys expire via TTL, no `SCAN`. Not implemented here: extra leftover keys until TTL, and `SCAN` + prefix delete is enough at this scale. Documented as a known next step, not as shipping code.
 
+**Why copy address and price onto the Order?**
+If OrderItem only stored `productId`, a later catalog price change would rewrite history. Checkout reads live Mongo **once**, then writes name, price, qty, lineTotal. Address fields are copied the same way so editing a saved address does not mutate old bills.
+
+**Why Mongo `productId` is a string on OrderItem, not a Postgres FK?**
+Products live in Mongo. Postgres cannot reference that `_id` as a foreign key. The line stores the id as text plus the snapshot.
+
+**Why decrement stock with `$gte` + `$inc`, not read-then-write?**
+Two checkouts can both read `quantity: 1` and both sell. `findOneAndUpdate({ quantity: { $gte: qty } }, { $inc: { quantity: -qty } })` is one atomic check. `null` → not enough stock. Lines already decremented are rolled back (`restoreStock`) if a later line fails or Prisma/Razorpay throws.
+
+**Why clear the cart after the order row exists?**
+Clear first + create fails = basket gone and no bill. Redis is not in the Prisma transaction. Order + items + payment first, then `DEL cart:<userId>`.
+
+**Why Razorpay order inside checkout, not a second “pay” endpoint?**
+One round trip: local order + Razorpay `order_id` for Checkout. The browser never sends an amount to charge — only that id.
+
+**Why webhook HMAC on `req.rawBody`, not `JSON.stringify(req.body)`?**
+Razorpay signs the exact bytes. Re-serializing JSON can change key order/spacing and fail the signature. `express.json({ verify })` stores the buffer as `req.rawBody`.
+
+**Why both `/payments/verify` and `/payments/webhook`?**
+Verify = Checkout `handler` (user still on the page). Webhook = Razorpay’s server, even if they close the tab. Both call `capturePayment`. If status is not `PENDING`, return — idempotent.
+
+**Why cancel PENDING restores stock immediately, but PAID waits for `refund.processed`?**
+PENDING never took money. PAID did — putting stock back before Razorpay confirms the refund would oversell if the refund fails.
+
+**Why `updateMany` where `status: PENDING` (or `REFUND_INITIATED`) before restore?**
+Two cancel/webhook deliveries can both pass an `if (status === …)` check. `updateMany` + `count === 0` claims the row once. `finishRefund` no-ops if the order is already `CANCELLED` (crash recovery if payment is `REFUNDED` but the order never flipped).
+
+**Why a partial unique index on default address?**
+Two first-address requests can both see “no default” and both insert `isDefault: true`. App logic is not enough. Postgres: `UNIQUE ("userId") WHERE "isDefault" = true`. A second `true` is `P2002`. Many `false` rows are allowed. Prisma 6 cannot express that `where` in schema — the index lives in a raw SQL migration.
+
 ---
 
 ## 📁 Project Structure
@@ -228,7 +270,7 @@ Versioning puts `v5` in the key and invalidates by bumping `v` — old keys expi
 ecommerce-backend/
 │
 ├── prisma/
-│   ├── schema.prisma              # PostgreSQL schema — User, RefreshToken
+│   ├── schema.prisma              # User, RefreshToken, Address, Order, OrderItem, Payment
 │   └── migrations/                # Full migration history
 │
 ├── src/
@@ -237,23 +279,33 @@ ecommerce-backend/
 │   │   ├── mongoose.js            # MongoDB connection
 │   │   ├── redis.js               # Redis client + connectRedis()
 │   │   ├── mailer.js              # Nodemailer Gmail transporter
+│   │   ├── razorpay.js            # Razorpay SDK instance
 │   │   └── cloudinary.js          # Cloudinary SDK configuration
 │   │
 │   ├── controllers/
 │   │   ├── auth.controller.js
 │   │   ├── cart.controller.js
+│   │   ├── address.controller.js
+│   │   ├── order.controller.js
+│   │   ├── payment.controller.js
 │   │   ├── product.controller.js
 │   │   └── category.controller.js
 │   │
 │   ├── services/
 │   │   ├── auth.service.js
 │   │   ├── cart.service.js
+│   │   ├── address.service.js
+│   │   ├── order.service.js
+│   │   ├── payment.service.js
 │   │   ├── product.service.js
 │   │   └── category.service.js
 │   │
 │   ├── routes/
 │   │   ├── auth.routes.js
 │   │   ├── cart.routes.js
+│   │   ├── address.routes.js
+│   │   ├── order.routes.js
+│   │   ├── payment.routes.js
 │   │   ├── product.routes.js
 │   │   └── category.routes.js
 │   │
@@ -273,6 +325,8 @@ ecommerce-backend/
 │   ├── validators/
 │   │   ├── auth.validator.js      # Zod schemas for auth routes
 │   │   ├── cart.validator.js      # Zod schema for add-to-cart
+│   │   ├── address.validator.js
+│   │   ├── order.validator.js     # checkout addressId uuid
 │   │   └── product.validator.js   # Zod schemas for product routes
 │   │
 │   ├── utils/
@@ -280,7 +334,8 @@ ecommerce-backend/
 │   │   ├── asyncHandler.js        # Eliminates try/catch in every controller
 │   │   ├── tokenUtils.js          # JWT generation helpers
 │   │   ├── slugify.js             # URL-friendly slug generation
-│   │   └── cache.js               # SCAN invalidation + SET NX lock helpers
+│   │   ├── cache.js               # SCAN invalidation + SET NX lock helpers
+│   │   └── stock.js               # restoreStock (checkout rollback, cancel, refund)
 │   │
 │   ├── scripts/
 │   │   └── seedProducts.js        # Faker.js seed — realistic demo products
@@ -856,6 +911,148 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 
 ---
 
+### Address Module
+
+All address routes require `protect`. `userId` comes from the JWT, **never** from the body. `PATCH /:id/default` is registered **before** `PUT /:id` so Express does not treat `"default"` as an `:id`.
+
+Postgres enforces **at most one default per user** with a partial unique index (`WHERE "isDefault" = true`). Prisma 6 cannot declare that `where` in `schema.prisma` — the index is a raw SQL migration. Concurrent first-address creates: one `201`, the other `P2002` → `409`.
+
+---
+
+#### POST `/addresses`
+
+**Purpose:** Save a shipping address for the logged-in user. The first address becomes default even if `isDefault` is omitted.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `validate(createAddressSchema)` → `createAddress` |
+
+**Request Body:**
+```json
+{
+  "fullName": "Sahil Sharma",
+  "phone": "9876543210",
+  "line1": "123 MG Road",
+  "line2": "Near City Mall",
+  "city": "Jaipur",
+  "state": "Rajasthan",
+  "pincode": "302001",
+  "isDefault": true
+}
+```
+
+**Success Response (201):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid",
+    "userId": "uuid",
+    "fullName": "Sahil Sharma",
+    "phone": "9876543210",
+    "line1": "123 MG Road",
+    "line2": "Near City Mall",
+    "city": "Jaipur",
+    "state": "Rajasthan",
+    "pincode": "302001",
+    "isDefault": true
+  }
+}
+```
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | Phone must be 10 digits / Pincode must be 6 digits | Zod |
+| 401 | No token / jwt expired / Token revoked | `protect` |
+| 409 | Another address was made default at the same time | Unique index `P2002` — retry |
+
+**Internal Flow:**
+1. Inside `$transaction`: look for an existing default for this `userId`
+2. `isDefault = data.isDefault === true || !hasDefault` — first address always default
+3. If this row will be default, `updateMany` unsets every other default for that user, **then** `create`
+4. Both steps in one transaction so a failed insert cannot leave the user with **zero** defaults
+5. `P2002` → 409 (two requests both tried to become the only default)
+
+---
+
+#### GET `/addresses`
+
+**Purpose:** List **this** user's addresses. Default first.
+
+| Field | Details |
+|---|---|
+| **Method** | `GET` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `getAddresses` |
+
+**Success Response (200):** `{ "success": true, "data": [ ... ] }` — empty array if none, **not** 404.
+
+**Internal Flow:** `findMany({ where: { userId }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }] })`.
+
+---
+
+#### PUT `/addresses/:id`
+
+**Purpose:** Update fields on an address the user owns. Zod schema is `.partial()` so a body may contain only `city`.
+
+| Field | Details |
+|---|---|
+| **Method** | `PUT` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `validate(updateAddressSchema)` → `updateAddress` |
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 404 | Address not found | No row with this `id` **and** `userId` (someone else's id looks the same) |
+
+**Internal Flow:**
+1. `findFirst({ id, userId })` — not yours → 404 (does not confirm the id exists)
+2. `isDefault: true` → unset others (`id: { not: id }`), then update
+3. `isDefault: false` **and** this row **was** default → after update, promote the newest other address so checkout always has a default
+4. All of that in one `$transaction`
+
+---
+
+#### PATCH `/addresses/:id/default`
+
+**Purpose:** Make this address the only default. No body.
+
+| Field | Details |
+|---|---|
+| **Method** | `PATCH` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `setDefaultAddress` |
+
+**Internal Flow:** Ownership check → if already default, return it → else unset all defaults for the user, set this one `true`, in a transaction.
+
+---
+
+#### DELETE `/addresses/:id`
+
+**Purpose:** Delete an address the user owns.
+
+| Field | Details |
+|---|---|
+| **Method** | `DELETE` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `deleteAddress` |
+
+**Success Response (200):** `{ "success": true }`
+
+**Internal Flow:**
+1. Ownership check → 404 if missing
+2. `$transaction`: `delete` the row
+3. If it **was** default, `findFirst` remaining for that user (`orderBy: createdAt desc`) and set `isDefault: true`
+4. Last address deleted → zero defaults is fine (no one left to promote)
+
+---
+
 ### Product Module
 
 #### POST `/products`
@@ -1232,6 +1429,259 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 
 ---
 
+### Orders Module
+
+#### POST `/orders/checkout`
+
+**Purpose:** Turn the Redis cart into a PostgreSQL order, decrement Mongo stock, and create a Razorpay order. Money is **not** captured yet — status is `PENDING` until webhook/verify.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `validate(checkoutSchema)` → `checkout` |
+
+**Request Body:**
+```json
+{
+  "addressId": "ad18fcff-44da-4c36-ba37-ac1a3dd7ff8e"
+}
+```
+> `addressId` must be a UUID (Zod). Amount is **never** taken from the client.
+
+**Success Response (201):**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "uuid",
+    "userId": "uuid",
+    "status": "PENDING",
+    "total": "100.00",
+    "fullName": "Sahil Sharma",
+    "phone": "9876543210",
+    "line1": "123 MG Road",
+    "city": "Jaipur",
+    "state": "Rajasthan",
+    "pincode": "302001",
+    "items": [
+      {
+        "productId": "6a103adfa0a1a0b4e51ea1f6",
+        "name": "Test Product",
+        "price": "100.00",
+        "quantity": 1,
+        "lineTotal": "100.00"
+      }
+    ],
+    "payment": {
+      "razorpayOrderId": "order_xxxxxxxx",
+      "razorpayPaymentId": null,
+      "amount": "100.00",
+      "status": "PENDING"
+    }
+  }
+}
+```
+> Prisma `Decimal` often serializes as a **string**. After this call the Redis cart is empty and Mongo `quantity` is reduced.
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | Invalid address ID | Zod — not a UUID |
+| 400 | Cart is empty | Redis hash missing or no fields |
+| 400 | Not enough stock | Mongo `findOneAndUpdate` returned `null` (`quantity < qty` or inactive) |
+| 403 | Forbidden | Address exists but `userId` does not match JWT |
+| 404 | Address not found | No row with that id |
+| 401 | No token / jwt expired / Token revoked | `protect` |
+
+**Internal Flow:**
+1. `prisma.address.findUnique({ id })`. Missing → 404. `address.userId !== userId` → **403** (checkout confirms the id exists; address **update** still uses 404 for “not yours”)
+2. `HGETALL cart:<userId>`. No fields → 400. Empty cart is still a cart — this is a bad request, not a missing resource
+3. For each hash field: `Product.findOneAndUpdate({ _id, isActive: true, quantity: { $gte: qty } }, { $inc: { quantity: -qty } }, { new: true })`. `null` → throw 400 after rolling back lines already decremented (`restoreStock`)
+4. Snapshot **name, price, quantity, lineTotal** onto each `OrderItem`. Sum `total`. Price is **not** read from Mongo later
+5. `razorpayInstance.orders.create({ amount: Math.round(Number(total) * 100), currency: 'INR', receipt: 'rcpt_' + Date.now() })`. Amount is **paise** (integer). Receipt must be ≤ 40 characters (`order_${userId}_${Date.now()}` is too long)
+6. `prisma.order.create` with nested `items.create` and `payment.create` (`PENDING`, `razorpayOrderId`). Nested writes are one Postgres transaction
+7. **Then** `clearCart(userId)` and `invalidateCache('cache:/products')`. Cache must drop or `GET /products` still shows the old quantity (slug is uncached and was already correct)
+8. `catch`: `restoreStock(taken)` then rethrow. Razorpay/Prisma failure must not leave stock gone. Cart is only cleared after step 6 succeeds
+
+Checkout does **not** trust a client-sent total. Razorpay Checkout is opened with this `order_id` and `RAZORPAY_KEY_ID` only.
+
+---
+
+#### GET `/orders`
+
+**Purpose:** List the logged-in user's orders, newest first.
+
+| Field | Details |
+|---|---|
+| **Method** | `GET` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `getOrders` |
+
+**Success Response (200):** `{ "success": true, "data": [ ... ] }` — empty array if none, **not** 404.
+
+**Internal Flow:** `findMany({ where: { userId }, include: { items: true, payment: true }, orderBy: { createdAt: 'desc' } })`. Registered as `GET /` **before** `GET /:id`.
+
+---
+
+#### GET `/orders/:id`
+
+**Purpose:** Fetch one order the user owns, with line items and payment.
+
+| Field | Details |
+|---|---|
+| **Method** | `GET` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `getOrder` |
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 404 | Order not found | No row with that id |
+| 403 | Forbidden | Row exists, `order.userId !== req.user.userId` |
+
+**Internal Flow:**
+1. `findUnique({ id, include: items + payment })`
+2. Missing → 404
+3. Wrong owner → 403 (same choice as checkout address — “it exists, not yours”)
+4. Compare `order.userId` to **`userId`**, not to `orderId` (that bug 403s even on your own order)
+
+---
+
+#### POST `/orders/:id/cancel`
+
+**Purpose:** Cancel an order. PENDING restores stock immediately. PAID starts a Razorpay refund; stock returns when the **webhook** says the refund finished.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | Yes |
+| **Middleware Chain** | `protect` → `cancelOrder` |
+
+**Success Response (200):**
+```json
+{ "success": true, "message": "Order cancelled" }
+```
+PAID path: `{ "success": true, "message": "Refund initiated, this may take a few days", "payment": { ... } }`.
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 404 | Order not found | No row |
+| 403 | Forbidden | Not the owner |
+| 400 | Order cannot be cancelled - already processed | `updateMany` `count === 0` (two clicks, or status already moved) |
+| 400 | Order cannot be cancelled - current status: … | `CANCELLED` / `FAILED` |
+| 400 | No captured payment found / Refund already initiated | PAID path |
+
+**Internal Flow (PENDING):**
+1. Load order + items + payment; 404 / 403 as above
+2. `updateMany({ id, status: 'PENDING' }, { status: 'CANCELLED' })` **first** — claims the row so two cancels cannot both restore stock
+3. `count === 0` → 400
+4. `restoreStock(order.items)` (`$inc` quantity back in Mongo)
+5. `invalidateCache('cache:/products')`
+
+**Internal Flow (PAID):**
+1. `initiateRefund`: require `razorpayPaymentId`; `updateMany` `CAPTURED` → `REFUND_INITIATED` (`count === 0` → already refunding)
+2. Call Razorpay `payments.refund`. If that throws, set payment back to `CAPTURED` and rethrow
+3. Stock is **not** restored here. `refund.processed` webhook runs `finishRefund`
+
+---
+
+### Payments Module
+
+Razorpay **test** keys live in `.env`. The browser only ever sees `KEY_ID` + `order_id`. Webhooks cannot hit `localhost` — use `npx ngrok http 3000` and set the dashboard URL to `https://<host>/payments/webhook`. Events: `payment.captured`, `refund.processed`.
+
+A local `pay.html` (Razorpay Checkout.js) is for trying a card in the browser. **Do not commit** it with a real `key` or `order_id`. Indian **test** card e.g. `4386 2894 0766 0153` — `4111…` is treated as international and is rejected. Test mode has a **max amount**; seed products over ~₹1 lakh fail — checkout a cheap product. Disable **Magic Checkout** (OTP to a phone) under Checkout Features; use Standard Checkout + Card.
+
+`app.js` stores the raw request bytes:
+
+```javascript
+app.use(express.json({
+    verify: (req, res, buf) => { req.rawBody = buf }
+}))
+```
+
+---
+
+#### POST `/payments/verify`
+
+**Purpose:** Confirm a Checkout `handler` payload. HMAC uses `KEY_SECRET` on `order_id|payment_id`. Then the same `capturePayment` as the webhook.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | No — authenticity is the signature |
+| **Middleware Chain** | `verifyPayment` |
+
+**Request Body:**
+```json
+{
+  "razorpay_order_id": "order_xxx",
+  "razorpay_payment_id": "pay_xxx",
+  "razorpay_signature": "hex"
+}
+```
+
+**Success Response (200):** `{ "success": true, "data": { "status": "CAPTURED", ... } }`
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | Invalid signature | HMAC mismatch |
+| 404 | Payment not found | No Payment row with that `razorpayOrderId` |
+
+**Internal Flow:**
+1. `HMAC-SHA256(KEY_SECRET, orderId + '|' + paymentId)` vs `razorpay_signature`
+2. `capturePayment(orderId, paymentId)`
+
+---
+
+#### POST `/payments/webhook`
+
+**Purpose:** Razorpay server callback. HMAC of **raw body** with `WEBHOOK_SECRET` (not the key secret). Header: `x-razorpay-signature`.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | No |
+| **Middleware Chain** | `razorpayWebhook` |
+
+**Success Response (200):** `{ "success": true }` even when the event is ignored — so Razorpay does not retry forever on events we do not handle.
+
+**Internal Flow:**
+1. `HMAC-SHA256(WEBHOOK_SECRET, req.rawBody)` vs header. Re-serializing `req.body` can change bytes and fail the signature
+2. `payment.captured` → `capturePayment(entity.order_id, entity.id)`
+3. `refund.processed` → `handleRefundProcessed(entity.payment_id)`
+4. Any other event → `{ received: true }`
+
+---
+
+##### `capturePayment(razorpayOrderId, razorpayPaymentId)` *(shared)*
+
+1. `findUnique({ razorpayOrderId })` — field is `@unique` (required for `findUnique`; a missing unique threw at runtime until the migration)
+2. Missing → 404
+3. `status !== 'PENDING'` → return as-is (**idempotent**: verify and webhook can race)
+4. `$transaction`: payment `CAPTURED` + `razorpayPaymentId`, order `PAID`
+
+##### `handleRefundProcessed` / `finishRefund`
+
+1. Find payment by `razorpayPaymentId`
+2. `updateMany` `REFUND_INITIATED` → `REFUNDED` (claim)
+3. `finishRefund(orderId)` always:
+   - Load order + items
+   - Already `CANCELLED` → return (no second `$inc`)
+   - Else restore stock, set order `CANCELLED`, `invalidateCache('cache:/products')`
+4. If the process died after `REFUNDED` but before cancel, a retry still calls `finishRefund` and completes the order/stock side
+
+`restoreStock` lives in `src/utils/stock.js` so `order.service` and `payment.service` can both use it **without a require cycle**.
+
+---
+
+## 🧩 Function & Middleware Reference
 ## 🧩 Function & Middleware Reference
 
 > Only functions with non-trivial internal logic are documented here. Simple pass-through controllers are omitted.
@@ -1614,6 +2064,76 @@ const generateRefreshToken = (userId) =>
 
 ---
 
+### `order.service.checkout(userId, addressId)`
+
+| Detail | Value |
+|---|---|
+| **File** | `src/services/order.service.js` |
+| **Output** | Order with `items` and `payment`, status `PENDING` |
+
+**Internal Logic:**
+1. Address `findUnique` → 404 / 403 (wrong owner)
+2. Redis `hGetAll('cart:' + userId)` — empty → 400
+3. Loop lines: atomic Mongo decrement; push `{ productId, quantity }` onto `taken` for rollback
+4. Build snapshots and `total`
+5. Razorpay order (`Math.round(Number(total) * 100)`, `rcpt_${Date.now()}`)
+6. Prisma nested create (order + items + payment with `razorpayOrderId`)
+7. `clearCart` then `invalidateCache('cache:/products')` — without the cache drop, `GET /products` served stale quantity for 10 minutes
+8. `catch` → `restoreStock(taken)` then rethrow. Nested Prisma create is already one SQL transaction; Mongo/Razorpay are not in it
+
+---
+
+### `order.service.getOrder(userId, orderId)` / `getOrders(userId)`
+
+**getOrders:** `findMany` where `userId`, include items + payment, `createdAt desc`. Empty list is a valid 200.
+
+**getOrder:** `findUnique` by id, include items + payment. Missing 404. `order.userId !== userId` → 403. Must compare to **userId**, not `orderId`.
+
+---
+
+### `order.service.cancelOrder(userId, orderId)`
+
+**Internal Logic:**
+1. Load with items + payment; 404 / 403
+2. **PENDING:** `updateMany` where still `PENDING` → `CANCELLED`. `count === 0` → 400 (lost the race). Then `restoreStock` + invalidate cache
+3. **PAID:** `paymentService.initiateRefund(order)` — does not restore stock
+4. Else 400 with current status
+
+---
+
+### `restoreStock(items)` — `src/utils/stock.js`
+
+For each `{ productId, quantity }`, `findByIdAndUpdate` `$inc: { quantity: +n }`. Shared by checkout `catch`, PENDING cancel, and `finishRefund`. Kept out of `order.service` / `payment.service` so those two files never `require` each other (cycle).
+
+---
+
+### `payment.service.capturePayment(razorpayOrderId, razorpayPaymentId)`
+
+| Detail | Value |
+|---|---|
+| **File** | `src/services/payment.service.js` |
+
+**Internal Logic:**
+1. `findUnique({ razorpayOrderId })` — column is `@unique` (migration `add_unique_razorpay_order_id`). `findUnique` on a non-unique field throws
+2. Not `PENDING` → return (idempotent)
+3. `$transaction`: payment `CAPTURED` + order `PAID`
+
+Called from **both** `verifyPayment` (Checkout HMAC) and `handleWebhook` (`payment.captured`).
+
+---
+
+### `payment.service.verifyPayment(body)` / `handleWebhook(rawBody, signature, payload)`
+
+**verifyPayment:** HMAC of `orderId|paymentId` with `RAZORPAY_KEY_SECRET`, then `capturePayment`.
+
+**handleWebhook:** HMAC of **raw Buffer** with `RAZORPAY_WEBHOOK_SECRET` vs `x-razorpay-signature`. `payment.captured` → `capturePayment`. `refund.processed` → `handleRefundProcessed`. Other events ignored with 200.
+
+**handleRefundProcessed:** `updateMany` `REFUND_INITIATED` → `REFUNDED`, then `finishRefund`. `finishRefund` no-ops if order is already `CANCELLED`; otherwise restores stock, sets `CANCELLED`, invalidates product cache.
+
+**initiateRefund:** `updateMany` `CAPTURED` → `REFUND_INITIATED` (`count === 0` → already in flight). Then Razorpay `refund`. On Razorpay error, payment is set back to `CAPTURED`.
+
+---
+
 ## ⏱ Rate Limiting
 
 All counters live in Redis (`rate-limit-redis`) so two Node processes share one count. In-memory limits would reset on restart and double under two instances.
@@ -1695,6 +2215,66 @@ expiresAt   DateTime  7 days from creation
 createdAt   DateTime  Auto-set on creation
 ```
 **Relationship:** One User → Many RefreshTokens (multi-device support). Foreign key uses `ON DELETE RESTRICT` — a user with active refresh tokens can't be deleted until those tokens are removed first.
+
+#### Address
+```
+id          String    UUID, Primary Key
+userId      String    Foreign Key -> User.id
+fullName    String
+phone       String    10 digits (validated in Zod, not the DB)
+line1       String
+line2       String?   Optional
+city        String
+state       String
+pincode     String    6 digits (Zod)
+isDefault   Boolean   Default: false
+createdAt   DateTime
+updatedAt   DateTime
+```
+**Relationship:** One User → Many Addresses.
+
+**Partial unique index** `one_default_address_per_user` on `"userId"` **where** `"isDefault" = true` (raw SQL migration). Many `false` rows per user are allowed. A second `true` is `P2002`. Prisma 6 cannot declare `@@unique(..., where)` — do not `db pull` expecting that to appear as schema `where`.
+
+#### Order
+```
+id          String    UUID, Primary Key
+userId      String    Foreign Key -> User.id
+status      Enum      PENDING | PAID | FAILED | CANCELLED, Default: PENDING
+total       Decimal(12,2)
+fullName, phone, line1, line2?, city, state, pincode
+            copied from Address at checkout — later address edits do not rewrite old bills
+createdAt   DateTime
+updatedAt   DateTime
+```
+**Relationship:** One User → Many Orders. One Order → Many OrderItems. One Order → One Payment (`orderId` unique on Payment).
+
+#### OrderItem
+```
+id          String    UUID, Primary Key
+orderId     String    Foreign Key -> Order.id
+productId   String    Mongo `_id` as text — **not** a Postgres FK
+name        String    snapshot
+price       Decimal(12,2)  snapshot
+quantity    Int
+lineTotal   Decimal(12,2)  price * quantity stored so history is stable
+```
+
+#### Payment
+```
+id                  String    UUID, Primary Key
+orderId             String    Unique, FK -> Order.id
+razorpayOrderId     String?   Unique (required for Prisma `findUnique`)
+razorpayPaymentId   String?
+amount              Decimal(12,2)
+status              Enum      PENDING | CAPTURED | FAILED | REFUND_INITIATED | REFUNDED
+createdAt           DateTime
+updatedAt           DateTime
+```
+
+---
+
+#### User (relations added in Week 5)
+`addresses Address[]` and `orders Order[]` on the User model.
 
 ### MongoDB (via Mongoose)
 
@@ -1794,9 +2374,9 @@ In development mode, responses also include:
 |--------|------|---------|
 | 400 | Bad Request | Validation failed, invalid ObjectId format, invalid/expired OTP, quantity out of range |
 | 401 | Unauthorized | Missing/expired/invalid token, missing/invalid refresh token |
-| 403 | Forbidden | Authenticated but not `ADMIN` |
-| 404 | Not Found | Product, category, or user doesn't exist |
-| 409 | Conflict | Duplicate email registration |
+| 403 | Forbidden | Authenticated but not `ADMIN`; address/order belongs to another user |
+| 404 | Not Found | Product, category, address, or order doesn't exist |
+| 409 | Conflict | Duplicate email; concurrent second default address (`P2002`) |
 | 429 | Too Many Requests | Rate limiter tripped (auth, public, or cart) |
 | 500 | Server Error | Unexpected crash — details hidden in production |
 
@@ -1811,6 +2391,7 @@ In development mode, responses also include:
 - Redis (Memurai on Windows works as a drop-in)
 - npm or yarn
 - A Gmail account with 2-Step Verification and an **App Password** (normal Gmail password will get `535 BadCredentials`)
+- Razorpay **test** account (optional until you hit checkout). Webhooks locally: `npx ngrok http 3000`
 
 ### 1. Clone the repository
 ```bash
@@ -1878,6 +2459,11 @@ CLOUDINARY_API_SECRET=your_api_secret
 # Gmail (OTP) — App Password, 16 characters, no spaces
 EMAIL_USER=youremail@gmail.com
 EMAIL_PASS=abcdefghijklmnop
+
+# Razorpay (test keys — never commit secrets)
+RAZORPAY_KEY_ID=rzp_test_xxx
+RAZORPAY_KEY_SECRET=xxx
+RAZORPAY_WEBHOOK_SECRET=xxx
 ```
 
 Generate secure secrets:
@@ -1984,6 +2570,38 @@ curl -X DELETE http://localhost:3000/cart \
   -H "Authorization: Bearer <your_access_token>"
 ```
 
+**Create address:**
+```bash
+curl -X POST http://localhost:3000/addresses \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your_access_token>" \
+  -d '{"fullName":"Sahil Sharma","phone":"9876543210","line1":"123 MG Road","city":"Jaipur","state":"Rajasthan","pincode":"302001"}'
+```
+
+**Checkout:**
+```bash
+curl -X POST http://localhost:3000/orders/checkout \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <your_access_token>" \
+  -d '{"addressId":"<uuid>"}'
+```
+
+**List / get / cancel orders:**
+```bash
+curl http://localhost:3000/orders -H "Authorization: Bearer <your_access_token>"
+curl http://localhost:3000/orders/<orderId> -H "Authorization: Bearer <your_access_token>"
+curl -X POST http://localhost:3000/orders/<orderId>/cancel \
+  -H "Authorization: Bearer <your_access_token>"
+```
+
+**Razorpay (after Checkout in a browser / `pay.html` locally):**
+```bash
+curl -X POST http://localhost:3000/payments/verify \
+  -H "Content-Type: application/json" \
+  -d '{"razorpay_order_id":"order_xxx","razorpay_payment_id":"pay_xxx","razorpay_signature":"hex"}'
+```
+Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (HMAC is over the raw body).
+
 ---
 
 ## 🧠 What I Learned
@@ -2057,6 +2675,37 @@ curl -X DELETE http://localhost:3000/cart \
 - **`await next()` released the lock too soon** — Express `next()` is not a Promise for the controller. Waiters stampeded. Fix: `releaseLock` in `res.json` `finally`
 - **SCAN infinite loop** — Redis returns cursor `"0"`. `!== 0` is always true for the string `"0"`. Loop until `cursor !== '0'`
 - **Stale product list after category rename** — product GET populates category name. Category writes must also `invalidateCache('cache:/products')`
+
+### Week 5 — Addresses, Orders, Razorpay
+
+**Engineering Concepts:**
+- **Cart vs order** — Redis may expire; a bill cannot. Postgres stores Order + OrderItem + Payment. Redis cart is copied then deleted
+- **Snapshots** — name, price, lineTotal, and shipping fields are copied at checkout. Catalog or address edits later must not rewrite history
+- **No Postgres FK to Mongo** — `OrderItem.productId` is a string. Two databases cannot share a foreign key
+- **Stock race** — read-then-write oversells. `findOneAndUpdate` with `quantity: { $gte: qty }` and `$inc: -qty` is one atomic check. Failures call `restoreStock` (`$inc` the other way)
+- **Clear cart last** — Redis is not in the Prisma transaction. Create the bill first; then `DEL` the hash
+- **Two DBs, no distributed transaction** — Mongo decrement + Postgres insert + Razorpay create. Compensate (restore stock) instead of 2PC
+- **Webhook vs Checkout verify** — HMAC of **raw body** + webhook secret vs HMAC of `order_id|payment_id` + key secret. Both call `capturePayment`. If status is not `PENDING`, return — either can arrive first
+- **Paise** — Razorpay `amount` is integer paise. `Math.round(Number(total) * 100)` because `0.45` is not exact in IEEE floats
+- **Partial unique index** — at most one `isDefault: true` per `userId`. App `count` outside a lock is not enough. Index lives in raw SQL on Prisma 6
+- **Claim then mutate** — `updateMany` where `PENDING` / `CAPTURED` / `REFUND_INITIATED` before restoring stock. Two cancels or two webhooks cannot both `$inc`
+- **403 vs 404** — checkout/get-order: address/order exists but is not yours → 403. Address **update**: `id` + `userId` miss → 404 so we do not confirm the uuid
+- **`utils/stock.js`** — `restoreStock` shared by checkout catch, PENDING cancel, and refund webhook without `order.service` ↔ `payment.service` require cycles
+
+**Challenges Faced:**
+- **Checkout did not invalidate product cache** — `GET /products` still showed old `quantity`; `GET /products/:slug` (uncached) was already correct. Stock writes must call `invalidateCache('cache:/products')`
+- **`findUnique` on non-unique `razorpayOrderId`** — Prisma throws until `@unique` + migrate (or `findFirst`)
+- **Receipt > 40 characters** — `order_${userId}_${Date.now()}` rejected by Razorpay; `rcpt_${Date.now()}`
+- **International test card** — `4111…` → “international card not supported”. Indian test Visa `4386 2894 0766 0153`
+- **Max amount exceeded** — test mode cap; seed prices ~₹1.3 lakh fail. Checkout a product under ₹1000
+- **Magic Checkout OTP** — dashboard Checkout Features; disable Magic / OTP; Standard Checkout + Card
+- **ngrok not in PATH** — `npx ngrok http 3000` after authtoken; webhook URL must match the current `https://….ngrok-free.app/payments/webhook`
+- **`pay.html`** — local browser harness only; never push `key` / `order_id`
+- **`restoreStock is not defined` in payment.service** — importing it from `order.service` would cycle; moved to `utils/stock.js`
+- **Prisma 6 vs `partialIndexes`** — `@@unique(..., where)` needs Prisma 7.4+; `migrate --create-only` + raw `CREATE UNIQUE INDEX ... WHERE "isDefault" = true`
+- **`getOrders` called `getOrder`** — one-order function without `orderId` → 404. Controller must call `getOrders` (with **s**)
+- **`order.userId !== orderId`** — compared user uuid to order uuid; 403 on your own order. Compare to `userId`
+- **PUT `isDefault: false` on the default** — left zero defaults until promote-another was added (same idea as delete-default)
 
 ---
 
