@@ -61,6 +61,29 @@ const verifyEmailLimiter = rateLimit({
     handler: tooMany
 })
 
+const forgotIpLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 3,
+    store: store('rl:forgot:ip:'),
+    handler: tooMany
+})
+
+const forgotEmailLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 3,
+    store: store('rl:forgot:email:'),
+    keyGenerator: (req) => (req.body.email || '').toLowerCase(),
+    skip: (req) => !req.body?.email,
+    handler: tooMany
+})
+
+const resetIpLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 5,
+    store: store('rl:reset:ip:'),
+    handler: tooMany
+})
+
 const publicLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 100,
@@ -83,6 +106,9 @@ module.exports = {
     otpEmailLimiter,
     verifyIpLimiter,
     verifyEmailLimiter,
+    forgotIpLimiter,
+    forgotEmailLimiter,
+    resetIpLimiter,
     publicLimiter,
     cartLimiter
 }

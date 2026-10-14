@@ -10,6 +10,8 @@ const { restoreStock } = require('../utils/stock')
 
 const { invalidateCache } = require('../utils/cache')
 
+const emailQueue = require('../jobs/queue')
+
 const verifyPaymentSignature = (orderId, paymentId, signature) => {
     const body = orderId + '|' + paymentId
 
@@ -61,6 +63,12 @@ const capturePayment = async (razorpayOrderId, razorpayPaymentId) => {
             data: { status: 'PAID' }
         })
     ])
+
+    try{
+        await emailQueue.add('order-confirmation', { orderId: payment.orderId })
+    } catch (err) {
+        console.error('Failed to enqueue order confirmation:', err.message)
+    }
 
     return updatedPayment
 }

@@ -6,6 +6,8 @@ const AppError = require('../utils/AppError')
 const authService = require('../services/auth.service');
 const { success } = require('zod');
 
+const { resetPasswordSchema } = require('../validators/auth.validator')
+
 const register = asyncHandler(async (req, res) => {
     const {name, email, password} = req.body;
     const result = await authService.register(name, email, password);
@@ -105,4 +107,30 @@ const logout = asyncHandler(async (req, res) => {
     })
 })
 
-module.exports = { register, login, me, refresh, logout, sendOtp, verifyOtp }
+const forgotPassword = asyncHandler(async (req, res) => {
+    const { email } = req.body
+
+    await authService.forgotPassword(email)
+
+    res.status(200).json({
+        success: true,
+        message: 'If that email exists, we sent a reset token'
+    })
+})
+
+const resetPassword = asyncHandler(async (req, res) => {
+    const result = resetPasswordSchema.safeParse({
+        token: req.body.token || req.query.token,
+        password: req.body.password
+    })
+
+    if (!result.success) {
+        throw new AppError(result.error.issues[0].message, 400)
+    }
+
+    await authService.resetPassword(result.data.token, result.data.password)
+
+    res.status(200).json({ success: true })
+})
+
+module.exports = { register, login, me, refresh, logout, sendOtp, verifyOtp, forgotPassword, resetPassword }

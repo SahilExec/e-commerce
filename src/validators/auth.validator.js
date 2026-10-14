@@ -20,5 +20,13 @@ const verifyOtpSchema = z.object({
     otp: z.coerce.string().regex(/^\d{6}$/, 'OTP must be 6 digits')
 })
 
+const forgotPasswordSchema = z.object({
+    email: z.string().trim().email('Invalid email format')
+})
 
-module.exports = { registerSchema, loginSchema, sendOtpSchema, verifyOtpSchema }
+const resetPasswordSchema = z.object({
+    token: z.string().min(1, 'Token is required'),
+    password: z.string().min(8, 'Password must be at least 8 characters')
+})
+
+module.exports = { registerSchema, loginSchema, sendOtpSchema, verifyOtpSchema, forgotPasswordSchema, resetPasswordSchema }

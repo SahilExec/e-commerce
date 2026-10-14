@@ -14,6 +14,8 @@ const { id } = require('zod/locales')
 
 const transporter = require('../config/mailer')
 
+const emailQueue = require('../jobs/queue')
+
 const register = async(name, email, password) => {
 
     const emailLower = email.toLowerCase()
@@ -240,4 +242,49 @@ const logout = async (rawToken, accessToken) => {
     }
 }
 
-module.exports = {register, login, getMe, refreshAccessToken, logout, sendOtp, verifyOtp}
+const forgotPassword = async (email) => {
+    const emailLower = email.toLowerCase()
+
+    const user = await prisma.user.findUnique({ where: { email: emailLower } })
+
+    if (!user) {
+        return
+    }
+
+    const token = crypto.randomBytes(32).toString('hex')
+
+    const hashedToken = crypto
+        .createHash('sha256')
+        .update(token)
+        .digest('hex')
+
+    await redisClient.set('reset:' + hashedToken, emailLower, { EX: 900 })
+
+    await emailQueue.add('password-reset', { email: emailLower, token })
+}
+
+const resetPassword = async (token, password) => {
+    const hashedToken = crypto
+        .createHash('sha256')
+        .update(token)
+        .digest('hex')
+
+    const emailLower = await redisClient.get('reset:' + hashedToken)
+
+    if (!emailLower) {
+        throw new AppError('Reset token expired or not found', 400)
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10)
+
+    const user = await prisma.user.update({
+        where: { email: emailLower },
+        data: { password: hashedPassword }
+    })
+
+    await redisClient.del('reset:' + hashedToken)
+
+    await prisma.refreshToken.deleteMany({ where: { userId: user.id } })
+}
+
+module.exports = {register, login, getMe, refreshAccessToken, logout, sendOtp, verifyOtp, forgotPassword, resetPassword}
