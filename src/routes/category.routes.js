@@ -14,13 +14,17 @@ const categoryController = require('../controllers/category.controller')
 
 const cacheMiddleware = require('../middlewares/cache')
 
-router.post('/', protect, authorize('ADMIN'), categoryController.createCategory)
+const validate = require('../middlewares/validate')
+
+const { createCategorySchema, updateCategorySchema } = require('../validators/category.validator')
+
+router.post('/', protect, authorize('ADMIN'), validate(createCategorySchema), categoryController.createCategory)
 
 router.get('/', publicLimiter, cacheMiddleware(600), categoryController.getCategories)
 
 router.get('/:slug', publicLimiter, categoryController.getCategoryBySlug)
 
-router.put('/:id', protect, authorize('ADMIN'), categoryController.updateCategory)
+router.put('/:id', protect, authorize('ADMIN'), validate(updateCategorySchema), categoryController.updateCategory)
 
 router.delete('/:id', protect, authorize('ADMIN'), categoryController.deleteCategory)
 

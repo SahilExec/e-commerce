@@ -2,6 +2,10 @@ const express = require('express')
 
 const cookieParser = require('cookie-parser')
 
+const helmet = require('helmet')
+
+const cors = require('cors')
+
 const authRoutes = require('./routes/auth.routes');
 
 const productRoutes = require('./routes/product.routes')
@@ -19,6 +23,26 @@ const paymentRoutes = require('./routes/payment.routes')
 const errorHandler = require('./middlewares/errorHandler');
 
 const app = express();
+
+const allowedOrigins = (process.env.CORS_ORIGINS || '')
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter(Boolean)
+
+app.use(helmet())
+
+app.use(cors({
+    origin: (origin, cb) => {
+        if (!origin) {
+            return cb(null, true)
+        }
+        if (allowedOrigins.includes(origin)) {
+            return cb(null, true)
+        }
+        return cb(null, false)
+    },
+    credentials: true
+}))
 
 app.use(express.json({
     verify: (req, res, buf) => {

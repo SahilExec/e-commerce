@@ -12,7 +12,7 @@ const upload = require('../middlewares/upload')
 
 const validate = require('../middlewares/validate')
 
-const { createProductSchema } = require('../validators/product.validator')
+const { createProductSchema, updateProductSchema } = require('../validators/product.validator')
 
 const productController = require('../controllers/product.controller')
 
@@ -26,7 +26,7 @@ router.get('/filters', publicLimiter, productController.getProductFilters)
 
 router.get('/:slug', publicLimiter, productController.getProductBySlug)
 
-router.put('/:id', protect, authorize('ADMIN'), productController.updateProduct)
+router.put('/:id', protect, authorize('ADMIN'), validate(updateProductSchema), productController.updateProduct)
 
 router.delete('/:id', protect, authorize('ADMIN'), productController.deleteProduct)
 

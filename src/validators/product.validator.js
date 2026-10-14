@@ -12,4 +12,6 @@ const createProductSchema = z.object({
     })).optional()
 })
 
-module.exports = { createProductSchema }
+const updateProductSchema = createProductSchema.partial()
+
+module.exports = { createProductSchema, updateProductSchema }
