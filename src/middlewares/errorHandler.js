@@ -21,7 +21,7 @@ const errorHandler = (err, req, res, next) => {
     }
 
     res.status(statusCode).json({
-        sucess: false,
+        success: false,
         message: err.isOperational ? err.message : 'Something went wrong'
     })
 }

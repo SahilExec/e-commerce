@@ -63,8 +63,20 @@ const seedProducts = async () => {
     await mongoose.connect(process.env.MONGODB_URI)
     console.log('MongoDB connected')
 
-    // fetch categories
-    const categories = await Category.find({ isActive: true })
+    let categories = await Category.find({ isActive: true })
+
+    if (categories.length === 0) {
+        await Category.insertMany(
+            PRODUCT_TYPES.map((type) => ({
+                name: type.slug.charAt(0).toUpperCase() + type.slug.slice(1),
+                slug: type.slug,
+                parent: null,
+                isActive: true
+            }))
+        )
+        console.log('Seeded categories')
+        categories = await Category.find({ isActive: true })
+    }
 
     const categoryMap = {}
     categories.forEach(cat => {

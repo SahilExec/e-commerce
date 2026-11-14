@@ -1,8 +1,10 @@
+require('dotenv').config()
+require('../config/env')
+
 const logger = require('../config/logger')
 
-require('dotenv').config()
-
 const emailQueue = require('./queue')
+
 const { processOrderConfirmation, processPasswordReset } = require('./email.processor')
 
 emailQueue.process('order-confirmation', processOrderConfirmation)
