@@ -26,6 +26,8 @@ A production-grade, scalable e-commerce REST API built with Node.js, Express, Po
 - [Function & Middleware Reference](#-function--middleware-reference)
 - [Rate Limiting](#-rate-limiting)
 - [Response Caching](#-response-caching)
+- [Background Jobs](#-background-jobs)
+- [Logging](#-logging)
 - [Database Schema](#-database-schema)
 - [Pagination & Filtering](#-pagination--filtering)
 - [Error Handling](#-error-handling)
@@ -60,11 +62,14 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - Token **rotation** on every refresh (replay attack prevention)
 - Access-token **blacklist in Redis** on logout — stolen Bearer tokens die immediately, not after 15 minutes
 - **Email verification** via 6-digit OTP (Nodemailer + Gmail), hashed in Redis with a 10-minute TTL
-- OTP sent automatically on register; `POST /auth/send-otp` is the resend path
+- OTP sent automatically on register; `POST /auth/send-otp` is the resend path (still **on the request** — built before the queue)
+- **Forgot / reset password** — unguessable token hashed in Redis (15 min); email carries a **link** (`BASE_URL/auth/reset-password?token=`); worker sends it
 - Emails stored and looked up **lowercase** — `Sahil@Gmail.com` and `sahil@gmail.com` are the same account
 - **bcrypt** password hashing with configurable salt rounds
 - Role-based access control (`CUSTOMER` | `ADMIN`)
-- **Per-route rate limiting** (Redis-backed) — IP + email counters on auth, IP on public GETs, userId on cart
+- **Per-route rate limiting** (Redis-backed) — IP + email counters on auth (including forgot), IP on public GETs, userId on cart
+- **Helmet** security headers on every response
+- **CORS whitelist** (`CORS_ORIGINS`) with `credentials: true` for the refresh cookie; Postman / webhooks (no `Origin`) still allowed
 
 ### Shopping Cart
 - Cart stored in Redis as a **hash** (`cart:<userId>`), not in PostgreSQL or MongoDB
@@ -79,7 +84,8 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - **Checkout** copies Redis cart → Order + OrderItems + Payment (`PENDING`), snapshots name/price/address
 - Mongo stock decremented with `quantity: { $gte: qty }` + `$inc`; rollback if Prisma/Razorpay fails
 - **Razorpay** order created at checkout (`amount` in paise, `Math.round`); webhook HMAC on **raw body**; Checkout `order_id|payment_id` HMAC on `/payments/verify`
-- Shared **`capturePayment`** — idempotent `PENDING` → `PAID` / `CAPTURED`
+- Shared **`capturePayment`** — idempotent `PENDING` → `PAID` / `CAPTURED`; **enqueues** `order-confirmation` only on that flip
+- Confirmation mail is a **Bull job** — Gmail failure never changes `PAID`
 - **Cancel PENDING** restores stock; **cancel PAID** starts refund, stock returns on `refund.processed`
 
 ### Product Catalog
@@ -91,7 +97,8 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - **Slug auto-generation** — URL-friendly identifiers from product/category names, applied consistently via a shared utility
 - **Soft delete** — categories blocked from deletion if active products exist; products hidden via `isActive` flag
 - **Faker.js seed script** — generates realistic demo data across all categories with one command
-- **GET list caching** — `GET /products` and `GET /categories` cached in Redis for 10 minutes; query string is part of the key so `?page=1` and `?page=2` never share a slot
+- **GET list caching** — `GET /products` and `GET /categories` cached in Redis for 10 minutes; query string is part of the key so `?cursor=` pages never share a slot
+- **Cursor pagination** on `GET /products` — `limit` + `cursor` (last `_id`), no `skip` / `countDocuments`
 - **Cache invalidation on write** — product/category create, update, delete, and image upload delete matching `cache:` keys via `SCAN` (not `KEYS`)
 - **Cache stampede lock** — on a miss, only one request hits Mongo; others wait on a Redis `SET NX` lock then read the new cache
 
@@ -99,11 +106,13 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - Clean **Route → Controller → Service** separation
 - Global error handling with `AppError` class (operational vs programmer errors)
 - `asyncHandler` wrapper — zero try/catch repetition across controllers
-- **Zod** schema validation as reusable middleware
+- **Zod** schema validation as reusable middleware on every JSON body (reset is the one exception: token lives on the query, so Zod runs in the controller)
+- **Bull** email queue — API `add`s; a second process (`npm run worker`) sends mail
+- **Morgan → Winston** — HTTP access lines at `http` level; `errorHandler` logs message/stack/path **before** the response
 - Environment-aware error responses (full stack trace in dev, safe messages in prod)
 
 ### Data Layer
-- **Polyglot persistence** — PostgreSQL for relational data, MongoDB for flexible documents, Redis for cart / OTP / blacklist / rate limits / GET response cache
+- **Polyglot persistence** — PostgreSQL for relational data, MongoDB for flexible documents, Redis for cart / OTP / reset tokens / blacklist / rate limits / GET cache / Bull jobs
 - **Prisma ORM** with full migration history
 - **Mongoose** for MongoDB schema enforcement
 - **Compound indexes** on frequently queried field combinations
@@ -123,10 +132,13 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 | Runtime | Node.js + Express.js | HTTP server and routing |
 | Primary DB | PostgreSQL + Prisma ORM | Users, refresh tokens, addresses, orders, payments |
 | Document DB | MongoDB + Mongoose | Product catalog, categories (flexible schema) |
-| Cache / Cart / OTP | Redis (`redis` + `rate-limit-redis`) | Cart, OTP, blacklist, rate limits, GET response cache, stampede locks |
+| Cache / Cart / OTP / Queue | Redis (`redis` + `rate-limit-redis` + **ioredis** via Bull) | Cart, OTP, reset tokens, blacklist, rate limits, GET cache, stampede locks, Bull jobs |
 | Authentication | JWT + bcrypt | Stateless auth with secure password storage |
-| Email | Nodemailer + Gmail App Password | OTP delivery |
+| Email | Nodemailer + Gmail App Password | OTP (sync); reset + order confirmation (worker) |
+| Queue | Bull | `email` queue — `order-confirmation`, `password-reset` |
 | Validation | Zod | Runtime schema validation |
+| Security | Helmet + CORS | Headers + origin whitelist |
+| Logging | Morgan + Winston | Access logs + structured errors (`logs/`) |
 | Rate Limiting | express-rate-limit | Per-route limits with Redis store |
 | File Upload | Multer + Cloudinary | Image handling and CDN delivery |
 | Fake Data | @faker-js/faker | Realistic seed data generation |
@@ -209,7 +221,7 @@ Zod is the HTTP door — it only runs on that route. `register` and `sendOtp` ca
 `cacheMiddleware(ttl)` is the same shape as `validate(schema)`: one function, TTL as the argument, the service never hears about Redis. The list JSON is already what the client needs. Wrapping `res.json` stores that exact envelope without a second mapper.
 
 **Why the cache key includes `req.originalUrl`?**
-`GET /products` and `GET /products?page=2` are different lists. One key `cache:products` would let page 2 overwrite page 1. `cache:${originalUrl}` makes each query string its own entry. Prefix `cache:` so it never collides with `cart:`, `otp:`, `bl:`, `rl:`, or `lock:`.
+`GET /products` and `GET /products?cursor=<id>` are different lists. One key `cache:products` would let page 2 overwrite page 1. `cache:${originalUrl}` makes each query string its own entry. Prefix `cache:` so it never collides with `cart:`, `otp:`, `reset:`, `bl:`, `rl:`, `lock:`, or `bull:`.
 
 **Why fail-open if Redis is down?**
 Cache is a speedup, not the source of truth. A `GET` error or a failed `setEx` must still return Mongo. A shop that 500s because Redis restarted is worse than a shop that is merely slower.
@@ -262,6 +274,45 @@ Two cancel/webhook deliveries can both pass an `if (status === …)` check. `upd
 **Why a partial unique index on default address?**
 Two first-address requests can both see “no default” and both insert `isDefault: true`. App logic is not enough. Postgres: `UNIQUE ("userId") WHERE "isDefault" = true`. A second `true` is `P2002`. Many `false` rows are allowed. Prisma 6 cannot express that `where` in schema — the index lives in a raw SQL migration.
 
+**Why send order confirmation and reset mail as jobs, not `await sendMail` in the request?**
+Gmail is slow and can 535. If checkout waited on mail, the user would stare at a spinner after they already paid. If a throw after `PAID` rolled the order back, the shop would look unpaid while Razorpay already took the money. The API `add`s a job and returns. The worker sends. OTP is still on the request because it was built before the queue existed.
+
+**Why keep `PAID` if the email job fails?**
+Order status is payment truth. Bull retries 3 times with exponential backoff; then `queue.on('failed')` logs job id, name, orderId/email, error. Support can resend. There is no `emailSent` column this week — Bull’s failed list is enough.
+
+**Why enqueue confirmation only inside `capturePayment` after the flip?**
+`verify` and `webhook` both call `capturePayment`. The second call is a no-op on the DB. Enqueue on every call would send two mails. `add` runs only when status was `PENDING`. A Redis hiccup on `add` is try/caught so the webhook still 200s.
+
+**Why a second process (`npm run worker`) instead of `emailQueue.process` in `server.js`?**
+A thrown error inside a Bull processor is caught by Bull (retry / failed). What isolation actually buys: uncaught exceptions, OOM, unhandled queue `error` events, and Prisma-pool storms kill **that** Node process. If processors live in the API, `/products` dies with them. Two processes: the shop keeps taking checkout; jobs wait in Redis until the worker restarts. Scale HTTP and mail independently.
+
+**Why Bull + ioredis next to the existing `redis` package?**
+Cart, OTP, cache, and rate limits already use node-redis. Bull talks Redis through **ioredis**. Two clients to the same `127.0.0.1:6379` is normal. `queue.js` only constructs the Queue — **no** `.process()` — so requiring it from the API cannot start consumers.
+
+**Why one `email` queue and two job names?**
+Both jobs are “send mail.” One worker, one failed list, one retry policy. A second queue is for different concurrency or pausing one kind of mail — not needed yet.
+
+**Why Redis for the reset token, keyed by token hash?**
+Same shape as OTP: short-lived, one-shot. A `User` column would be a migration for a 15-minute secret. Key `reset:<sha256(token)>` → email so the **link only needs `?token=`** (email in the URL is PII in history/Referer). Lookup hashes the query token and `GET`s that key.
+
+**Why always 200 on forgot-password?**
+`404 email not registered` lets attackers probe accounts. Unknown email returns; the controller still 200s. Same idea as `sendOtp`.
+
+**Why `BASE_URL` and not `PASSWORD_RESET_URL`?**
+The env is the **origin**. The path `/auth/reset-password` lives in code. Same origin later for other links. No trailing slash (`http://localhost:3000/` + `/auth/...` would double-slash). Production frontend later changes the path string to `/reset-password`; the env stays the origin.
+
+**Why reset Zod in the controller, not `validate()` on the route?**
+`validate()` only `safeParse(req.body)`. The token is on `req.query` when the mail link is pasted into Postman. Merging `req.body.token || req.query.token` then `resetPasswordSchema.safeParse` is the one-off. Forgot still uses route `validate`.
+
+**Why Helmet + a CORS whitelist?**
+Helmet adds clickjacking / MIME-sniff / `X-Powered-By` headers. Browser JS may only call this API from origins in `CORS_ORIGINS`. Refresh is a cookie, so `credentials: true` and origin cannot be `*`. No `Origin` (Postman, Razorpay webhook, curl) is allowed. Unknown origin → `cb(null, false)` (browser blocks; API does not 500).
+
+**Why cursor pagination instead of `page` + `skip`?**
+`skip(10000)` still walks 10 000 docs. Inserts during a crawl duplicate or skip rows. `countDocuments` on every list is expensive. Cursor: `find({ _id: { $lt: cursor } }).sort({ _id: -1 }).limit(n)`. Fetch `limit+1` to set `hasMore`; return `n` items and `nextCursor` = last returned `_id`. No total / totalPages — infinite scroll does not need “page 3 of 40.”
+
+**Why Morgan into Winston, not two consoles?**
+Morgan is the access line. Winston is levels + files. Piping Morgan’s `write` into `logger.http` means one logger owns the terminal and `logs/combined.log`. `errorHandler` logs **before** the development `return` so 400s appear in `logs/error.log` locally too. `req.body` is never logged (passwords, tokens, signatures). `/health` is skipped.
+
 ---
 
 ## 📁 Project Structure
@@ -277,10 +328,11 @@ ecommerce-backend/
 │   ├── config/
 │   │   ├── prisma.js              # Prisma singleton — one connection pool
 │   │   ├── mongoose.js            # MongoDB connection
-│   │   ├── redis.js               # Redis client + connectRedis()
+│   │   ├── redis.js               # Redis client + connectRedis() (cart / OTP / cache)
 │   │   ├── mailer.js              # Nodemailer Gmail transporter
 │   │   ├── razorpay.js            # Razorpay SDK instance
-│   │   └── cloudinary.js          # Cloudinary SDK configuration
+│   │   ├── cloudinary.js          # Cloudinary SDK configuration
+│   │   └── logger.js              # Winston — console + logs/error.log + logs/combined.log
 │   │
 │   ├── controllers/
 │   │   ├── auth.controller.js
@@ -323,11 +375,18 @@ ecommerce-backend/
 │   │   └── errorHandler.js        # Global error handler (dev vs prod modes)
 │   │
 │   ├── validators/
-│   │   ├── auth.validator.js      # Zod schemas for auth routes
-│   │   ├── cart.validator.js      # Zod schema for add-to-cart
+│   │   ├── auth.validator.js      # register, login, OTP, forgot, reset
+│   │   ├── cart.validator.js
 │   │   ├── address.validator.js
 │   │   ├── order.validator.js     # checkout addressId uuid
-│   │   └── product.validator.js   # Zod schemas for product routes
+│   │   ├── payment.validator.js   # verify: razorpay_order_id / payment_id / signature
+│   │   ├── product.validator.js   # create + updateProductSchema.partial()
+│   │   └── category.validator.js  # create / update — name, description, parent only
+│   │
+│   ├── jobs/
+│   │   ├── queue.js               # Bull `email` queue (API and worker both require this)
+│   │   ├── email.processor.js     # order-confirmation + password-reset handlers
+│   │   └── worker.js              # process entry — npm run worker (no Express)
 │   │
 │   ├── utils/
 │   │   ├── AppError.js            # Custom error class with status codes
@@ -340,9 +399,10 @@ ecommerce-backend/
 │   ├── scripts/
 │   │   └── seedProducts.js        # Faker.js seed — realistic demo products
 │   │
-│   └── app.js                     # Express config — middlewares and routes
+│   └── app.js                     # Helmet, CORS, Morgan, JSON rawBody, routes
 │
-├── server.js                      # Entry point — starts HTTP server only
+├── logs/                          # Winston files (gitignored via *.log)
+├── server.js                      # HTTP process — npm run dev
 ├── .env.example                   # All required environment variables
 └── README.md
 ```
@@ -447,6 +507,22 @@ Authorization: Bearer <access_token>
        │  200 { success }      │                       │
        │<──────────────────────│                       │
        │  Same access token now fails protect (401 Token revoked)
+       │                       │                       │
+       │  POST /auth/forgot-password { email }         │
+       │──────────────────────>│                       │
+       │                       │  SET reset:<sha256>   │  Redis, 15 min
+       │                       │  emailQueue.add       │
+       │  200 always           │                       │
+       │<──────────────────────│                       │
+       │                       │  worker sendMail link │
+       │                       │                       │
+       │  POST /auth/reset-password?token=  { password }│
+       │──────────────────────>│                       │
+       │                       │  GET reset:<hash>     │
+       │                       │  bcrypt + deleteMany RT│
+       │                       │  DEL reset:<hash>     │
+       │  200                  │                       │
+       │<──────────────────────│                       │
 ```
 
 ---
@@ -767,6 +843,84 @@ Authorization: Bearer <access_token>
 2. SHA-256 the submitted OTP and compare to the stored hash — never compare raw codes
 3. On match: `prisma.user.update({ isVerified: true })`, then `DEL otp:<email>` so the same code cannot be reused
 4. Returns the user without `password`
+
+---
+
+#### POST `/auth/forgot-password`
+
+**Purpose:** If that email is a user, store a reset token and **enqueue** a mail with a link. Always 200.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | No |
+| **Middleware Chain** | `validate(forgotPasswordSchema)` → `forgotIpLimiter` → `forgotEmailLimiter` → `forgotPassword` |
+
+**Request Body:**
+```json
+{ "email": "sahil@example.com" }
+```
+
+**Success Response (200):**
+```json
+{
+  "success": true,
+  "message": "If that email exists, we sent a reset token"
+}
+```
+> Unknown email: service returns without enqueueing; controller still 200. Same enumeration guard as `sendOtp`.
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | Invalid email format | Zod on the route |
+| 429 | Too many requests | More than 3 forgot calls from this IP **or** for this email in 15 minutes |
+
+**Internal Flow:**
+1. Lowercase email, `findUnique`. No user → `return`
+2. `crypto.randomBytes(32).toString('hex')` — 64 hex chars, not a 6-digit OTP
+3. SHA-256 the token; `SET reset:<hash> <email> EX 900` (15 minutes). Lookup is by **token**, so the mail link has no email
+4. `emailQueue.add('password-reset', { email, token })` — raw token is on the job so retries resend the **same** link
+5. Worker builds `BASE_URL + '/auth/reset-password?token=' + token` and `sendMail`s HTML + text
+
+OTP mail stays `await sendMail` on the request. Only reset and order confirmation are jobs.
+
+---
+
+#### POST `/auth/reset-password`
+
+**Purpose:** Set a new password from the token on the link. All refresh sessions die.
+
+| Field | Details |
+|---|---|
+| **Method** | `POST` |
+| **Auth Required** | No |
+| **Middleware Chain** | `resetIpLimiter` → `resetPassword` (Zod in the **controller** — token is on `req.query` when the URL is pasted) |
+
+**How to call (Postman):** method **POST**, URL = the full link from the email, body:
+```json
+{ "password": "newpass12" }
+```
+
+Gmail’s click is a **GET**. This route is POST, so the browser will not reset by itself. Copy the link into Postman.
+
+**Success Response (200):** `{ "success": true }`
+
+**Error Responses:**
+
+| Status | Message | Cause |
+|---|---|---|
+| 400 | Token is required | Missing query and body token |
+| 400 | Password must be at least 8 characters | Zod |
+| 400 | Reset token expired or not found | Redis miss (used, never sent, or past 15 min) |
+| 429 | Too many requests | More than 5 reset attempts from this IP in 15 minutes |
+
+**Internal Flow:**
+1. Controller `resetPasswordSchema.safeParse({ token: req.body.token || req.query.token, password: req.body.password })`
+2. SHA-256 the token; `GET reset:<hash>` → email. Missing → 400
+3. `bcrypt.hash` the new password; `prisma.user.update` by that email
+4. `DEL` the Redis key (one-shot); `prisma.refreshToken.deleteMany({ userId })` (logout everywhere)
 
 ---
 
@@ -1119,7 +1273,7 @@ Postgres enforces **at most one default per user** with a partial unique index (
 
 #### GET `/products`
 
-**Purpose:** List products with category, search, attribute, and price filtering, plus pagination.
+**Purpose:** List products with category, search, attribute, and price filtering, plus **cursor** pagination.
 
 | Field | Details |
 |---|---|
@@ -1135,10 +1289,12 @@ Postgres enforces **at most one default per user** with a partial unique index (
 | `search` | string | — | Case-insensitive regex match on `name` |
 | `attributeKey` + `attributeValue` | string | — | Must be used together; matches one entry inside the `attributes` array via `$elemMatch` |
 | `minPrice` / `maxPrice` | number | — | Inclusive price range; non-numeric values are rejected with `400` before reaching MongoDB |
-| `page` | number | 1 | Clamped to a minimum of 1 — prevents a negative `$skip` |
-| `limit` | number | 10 | Capped at 50 server-side regardless of what's requested — prevents large-payload DoS |
+| `cursor` | ObjectId string | — | `_id` of the last item from the previous page; omit on the first page |
+| `limit` | number | 10 | Clamped 1–50 |
 
-**Example:** `GET /products?category=<phones_id>&minPrice=50000&maxPrice=150000&page=1&limit=20`
+`page` / `skip` / `total` / `totalPages` are gone. `?page=2` is ignored.
+
+**Example:** `GET /products?category=<phones_id>&minPrice=50000&limit=20` then `GET /products?...&cursor=<nextCursor>`
 
 **Success Response (200):**
 ```json
@@ -1146,15 +1302,12 @@ Postgres enforces **at most one default per user** with a partial unique index (
   "success": true,
   "data": {
     "products": [ "...array of product documents, category populated with name + slug" ],
-    "pagination": {
-      "total": 23,
-      "page": 1,
-      "limit": 20,
-      "totalPages": 2
-    }
+    "nextCursor": "65f1a2b3c4d5e6f7a8b9c0d1",
+    "hasMore": true
   }
 }
 ```
+Last page: `nextCursor: null`, `hasMore: false`.
 
 **Error Responses:**
 
@@ -1162,19 +1315,15 @@ Postgres enforces **at most one default per user** with a partial unique index (
 |---|---|---|
 | 400 | minPrice must be a number | `minPrice` isn't numeric |
 | 400 | maxPrice must be a number | `maxPrice` isn't numeric |
+| 400 | Invalid cursor | `cursor` is not a 24-char ObjectId |
 
 **Internal Flow:**
-1. Destructures all filters from `req.query` with defaults `page = 1, limit = 10`
-2. Validates `minPrice`/`maxPrice` with `isNaN(Number(...))` **before** building any query object — failing fast avoids leaking a raw Mongoose `CastError` (which would expose internal stack traces) to the client
-3. Builds the `query` object incrementally:
-   - `isActive: true` always included
-   - `category` → cast to `new mongoose.Types.ObjectId(category)` and matched with `categoryPath: { $in: [...] }`, which is what makes parent-category filtering work without recursive lookups
-   - `search` → `{ name: { $regex: search, $options: 'i' } }`
-   - `attributeKey` + `attributeValue` → `{ attributes: { $elemMatch: { key, value } } }`
-   - price range → builds `query.price.$gte` / `.$lte` only for the bounds that were actually supplied
-4. Computes `pageNum = Math.max(1, Number(page))` and `limitNum = Math.min(Number(limit), 50)`, then `skip = (pageNum - 1) * limitNum`
-5. Runs the product fetch and the total count **in parallel** with `Promise.all([Product.find(query)..., Product.countDocuments(query)])` — halves the wait time versus sequential `await` calls since neither query depends on the other's result
-6. Returns `products` alongside a `pagination` object built from `pageNum`/`limitNum`/`total`
+1. Same filter object as before (`isActive`, categoryPath `$in`, search regex, `$elemMatch`, price `$gte`/`$lte`)
+2. If `cursor` is set: `ObjectId.isValid` or 400; then `query._id = { $lt: ObjectId(cursor) }`
+3. `limitNum = min(max(1, Number(limit) || 10), 50)`
+4. `Product.find(query).sort({ _id: -1 }).limit(limitNum + 1)` — the extra row means “there is another page”
+5. `hasMore` if `rows.length > limitNum`; return `slice(0, limitNum)`; `nextCursor` is the **last returned** `_id` (not the extra row)
+6. `$lt` + sort `_id` descending = older than this id (newer products have larger `_id`s)
 
 ---
 
@@ -1265,7 +1414,7 @@ Postgres enforces **at most one default per user** with a partial unique index (
 | **Method** | `PUT` |
 | **Auth Required** | Yes |
 | **Role Required** | `ADMIN` |
-| **Middleware Chain** | `protect` → `authorize('ADMIN')` → `updateProduct` |
+| **Middleware Chain** | `protect` → `authorize('ADMIN')` → `validate(updateProductSchema)` → `updateProduct` |
 
 **Request Body (all fields optional):**
 ```json
@@ -1273,10 +1422,11 @@ Postgres enforces **at most one default per user** with a partial unique index (
 ```
 
 **Internal Flow:**
-1. **Why `:id` and not `:slug`?** The slug is derived from `name`. If a request updates `name`, the slug the client used to reach this route would already be stale by the time the update lands — `_id` never changes, so it's the only safe identifier for a mutation
-2. If `updateData.name` is present, the service regenerates `updateData.slug = slugify(updateData.name)` **before** calling Mongoose — `findByIdAndUpdate()` is query-level middleware and does **not** trigger the model's `pre('save')` hooks, so relying on a hook here would silently produce a stale slug
-3. `Product.findByIdAndUpdate(id, updateData, { new: true })` — `{ new: true }` returns the document *after* the update instead of the pre-update snapshot
-4. `null` result → `AppError('Product not found', 404)`
+1. `updateProductSchema = createProductSchema.partial()` — same rules as create, every field optional. Extra keys (`slug`, `images`) are **stripped** so `findByIdAndUpdate` cannot take them
+2. **Why `:id` and not `:slug`?** The slug is derived from `name`. If a request updates `name`, the slug the client used to reach this route would already be stale by the time the update lands — `_id` never changes, so it's the only safe identifier for a mutation
+3. If `updateData.name` is present, the service regenerates `updateData.slug = slugify(updateData.name)` **before** calling Mongoose — `findByIdAndUpdate()` is query-level middleware and does **not** trigger the model's `pre('save')` hooks, so relying on a hook here would silently produce a stale slug
+4. `Product.findByIdAndUpdate(id, updateData, { new: true })` — `{ new: true }` returns the document *after* the update instead of the pre-update snapshot
+5. `null` result → `AppError('Product not found', 404)`
 
 ---
 
@@ -1341,7 +1491,7 @@ Postgres enforces **at most one default per user** with a partial unique index (
 | **Method** | `POST` |
 | **Auth Required** | Yes |
 | **Role Required** | `ADMIN` |
-| **Middleware Chain** | `protect` → `authorize('ADMIN')` → `createCategory` |
+| **Middleware Chain** | `protect` → `authorize('ADMIN')` → `validate(createCategorySchema)` → `createCategory` |
 
 **Request Body:**
 ```json
@@ -1354,8 +1504,9 @@ Postgres enforces **at most one default per user** with a partial unique index (
 > `parent` is optional — omit it to create a top-level category.
 
 **Internal Flow:**
-1. Service generates `slug = slugify(name)`
-2. `Category.create({ name, slug, description, parent, image })` — `parent` defaults to `null` in the schema if omitted, marking it top-level
+1. Zod keeps only `name`, `description`, `parent` (`parent` is 24-char ObjectId or `null`). `slug` / `image` / `isActive` in the JSON are stripped
+2. Service generates `slug = slugify(name)`
+3. `Category.create({ name, slug, description, parent, image })` — `parent` defaults to `null` in the schema if omitted, marking it top-level
 
 ---
 
@@ -1400,6 +1551,12 @@ Postgres enforces **at most one default per user** with a partial unique index (
 #### PUT `/categories/:id`
 
 **Purpose:** Update a category (Admin only). Same slug-regeneration logic as product updates — `slugify()` is called explicitly when `name` changes.
+
+| Field | Details |
+|---|---|
+| **Middleware Chain** | `protect` → `authorize('ADMIN')` → `validate(updateCategorySchema)` → `updateCategory` |
+
+`updateCategorySchema` is the same three fields, all optional. Extra keys stripped before `findByIdAndUpdate`.
 
 ---
 
@@ -1614,7 +1771,7 @@ app.use(express.json({
 |---|---|
 | **Method** | `POST` |
 | **Auth Required** | No — authenticity is the signature |
-| **Middleware Chain** | `verifyPayment` |
+| **Middleware Chain** | `validate(verifyPaymentSchema)` → `verifyPayment` |
 
 **Request Body:**
 ```json
@@ -1631,6 +1788,7 @@ app.use(express.json({
 
 | Status | Message | Cause |
 |---|---|---|
+| 400 | Order ID is required | Zod — missing `razorpay_order_id` (same for payment_id / signature) |
 | 400 | Invalid signature | HMAC mismatch |
 | 404 | Payment not found | No Payment row with that `razorpayOrderId` |
 
@@ -1664,8 +1822,9 @@ app.use(express.json({
 
 1. `findUnique({ razorpayOrderId })` — field is `@unique` (required for `findUnique`; a missing unique threw at runtime until the migration)
 2. Missing → 404
-3. `status !== 'PENDING'` → return as-is (**idempotent**: verify and webhook can race)
+3. `status !== 'PENDING'` → return as-is (**idempotent**: verify and webhook can race — **no second email**)
 4. `$transaction`: payment `CAPTURED` + `razorpayPaymentId`, order `PAID`
+5. `try { emailQueue.add('order-confirmation', { orderId }) }` — catch and log; payment already succeeded
 
 ##### `handleRefundProcessed` / `finishRefund`
 
@@ -1681,7 +1840,6 @@ app.use(express.json({
 
 ---
 
-## 🧩 Function & Middleware Reference
 ## 🧩 Function & Middleware Reference
 
 > Only functions with non-trivial internal logic are documented here. Simple pass-through controllers are omitted.
@@ -1827,6 +1985,23 @@ app.use(express.json({
 
 ---
 
+### `auth.service.forgotPassword(email)` / `resetPassword(token, password)`
+
+| Detail | Value |
+|---|---|
+| **File** | `src/services/auth.service.js` |
+
+**forgotPassword:**
+1. Lowercase; `findUnique`; missing user → return (controller still 200)
+2. `randomBytes(32)` hex token; `SET reset:<sha256(token)> email EX 900`
+3. `emailQueue.add('password-reset', { email, token })`
+
+**resetPassword:**
+1. `GET reset:<sha256(token)>` → email or 400
+2. `bcrypt.hash` + `user.update`; `DEL` key; `refreshToken.deleteMany({ userId })`
+
+---
+
 ### `cart.service.addToCart(userId, productId, quantity)`
 
 | Detail | Value |
@@ -1870,15 +2045,15 @@ app.use(express.json({
 | Detail | Value |
 |---|---|
 | **File** | `src/services/product.service.js` |
-| **Output** | `{ products, pagination }` |
+| **Output** | `{ products, nextCursor, hasMore }` |
 
 **Internal Logic:**
 1. Validates `minPrice`/`maxPrice` numeric-ness **before** touching the query object — letting an invalid value flow into `query.price.$gte = Number("abc")` would store `NaN`, which Mongoose rejects with an unfiltered `CastError` that leaks internal stack details to the client
 2. Builds `query` conditionally — every filter (`category`, `search`, price range, `attributeKey`/`attributeValue`) is only added if actually supplied, so an empty query string returns the full active catalog
 3. `category` is cast with `new mongoose.Types.ObjectId(category)` before being placed in `categoryPath: { $in: [...] }` — query params arrive as plain strings, and MongoDB will not match a string against a stored ObjectId without this explicit cast
-4. `pageNum = Math.max(1, Number(page))` guards against `page=0` or negative values, which MongoDB's `$skip` rejects outright with a server error
-5. `limitNum = Math.min(Number(limit), 50)` hard-caps the page size — without this, a request like `?limit=1000000` would force MongoDB to scan and serialize an unbounded result set, a trivial denial-of-service vector
-6. `Promise.all([Product.find(...), Product.countDocuments(...)])` — runs the page fetch and the total count concurrently since neither depends on the other's result, roughly halving total latency versus two sequential `await`s
+4. Optional `cursor`: `ObjectId.isValid` or `AppError('Invalid cursor', 400)`; then `_id: { $lt: cursor }` with `sort({ _id: -1 })`
+5. `limitNum` clamped 1–50. `limit + 1` rows fetched; if more than `limitNum`, slice to `limitNum` and set `nextCursor` to the last **returned** `_id`
+6. No `countDocuments` / `skip` — those are the two costs cursor pagination removes
 
 ---
 
@@ -1942,7 +2117,8 @@ app.use(express.json({
 **Internal Logic:**
 1. `schema.safeParse(req.body)` — used instead of `.parse()` because `safeParse` never throws; it returns `{ success, data }` or `{ success: false, error }`, letting the middleware control exactly how validation failures are reported
 2. On failure, `result.error.issues.map(e => e.message)` collects every Zod issue message, and only the **first** one is passed into `AppError(..., 400)` — keeps error responses simple rather than dumping a full validation report
-3. On success, `req.body = result.data` — replaces the raw body with Zod's parsed/coerced version (e.g. `z.coerce.number()` outputs), so downstream code never has to re-validate or re-cast
+3. On success, `req.body = result.data` — replaces the raw body with Zod's parsed/coerced version (e.g. `z.coerce.number()` outputs), so downstream code never has to re-validate or re-cast. Unknown keys on `z.object({...})` are **stripped**, so `findByIdAndUpdate` cannot be fed `slug` / `image` from the client
+4. **Exception:** `POST /auth/reset-password` does not use this middleware — the token is on `req.query` when the mail link is pasted. The controller merges query + body then `resetPasswordSchema.safeParse`
 
 ---
 
@@ -1973,8 +2149,9 @@ const asyncHandler = (fn) => (req, res, next) => {
 
 **Internal Logic:**
 1. `statusCode = err.statusCode || 500` — defaults to `500` for errors that didn't originate from `AppError` (i.e. unexpected bugs)
-2. In `development`: always returns the real `err.message` plus `err.stack` — full visibility while debugging locally
-3. In `production`: returns `err.message` **only if** `err.isOperational === true` (i.e. it came from `AppError`); otherwise returns a generic `"Something went wrong"` — prevents leaking internal implementation details (file paths, library names, query structure) to real users or attackers probing the API
+2. `logger.error({ message, stack, path, method, statusCode })` **first** — so development's early `return` still writes `logs/error.log`. Never logs `req.body`
+3. In `development`: always returns the real `err.message` plus `err.stack` — full visibility while debugging locally
+4. In `production`: returns `err.message` **only if** `err.isOperational === true` (i.e. it came from `AppError`); otherwise returns a generic `"Something went wrong"` — prevents leaking internal implementation details (file paths, library names, query structure) to real users or attackers probing the API
 
 ---
 
@@ -2115,10 +2292,11 @@ For each `{ productId, quantity }`, `findByIdAndUpdate` `$inc: { quantity: +n }`
 
 **Internal Logic:**
 1. `findUnique({ razorpayOrderId })` — column is `@unique` (migration `add_unique_razorpay_order_id`). `findUnique` on a non-unique field throws
-2. Not `PENDING` → return (idempotent)
+2. Not `PENDING` → return (idempotent, **no** `emailQueue.add`)
 3. `$transaction`: payment `CAPTURED` + order `PAID`
+4. `emailQueue.add('order-confirmation', { orderId })` in try/catch — Redis down must not 500 the webhook
 
-Called from **both** `verifyPayment` (Checkout HMAC) and `handleWebhook` (`payment.captured`).
+Called from **both** `verifyPayment` (Checkout HMAC) and `handleWebhook` (`payment.captured`). The worker loads the order with `include: { user: true, items: true }` (Order has `user User @relation(...)`) and mails only if status is still `PAID`.
 
 ---
 
@@ -2134,6 +2312,18 @@ Called from **both** `verifyPayment` (Checkout HMAC) and `handleWebhook` (`payme
 
 ---
 
+### `src/jobs/queue.js` / `email.processor.js` / `worker.js`
+
+| File | Role |
+|---|---|
+| `queue.js` | `new Queue('email', { redis, defaultJobOptions: { attempts: 3, backoff: exponential 2s } })`. Export only. No `.process()` |
+| `email.processor.js` | `processOrderConfirmation` — load order+user+items, skip if not `PAID`, `sendMail`. `processPasswordReset` — build `BASE_URL/auth/reset-password?token=`, HTML + text |
+| `worker.js` | `dotenv`, `.process` both names, `completed` / `failed` / `error` via Winston. No `app.listen` |
+
+Job payloads: `{ orderId }` and `{ email, token }`. Failed handler logs id, name, orderId, email, error — **never** the raw token.
+
+---
+
 ## ⏱ Rate Limiting
 
 All counters live in Redis (`rate-limit-redis`) so two Node processes share one count. In-memory limits would reset on restart and double under two instances.
@@ -2145,6 +2335,8 @@ Each limiter is a **named export** (`loginIpLimiter`, `otpEmailLimiter`, …) �
 | Login | IP **and** email (two counters) | 10 each | `POST /auth/login` |
 | OTP send | IP **and** email | 3 each | `POST /auth/send-otp` |
 | OTP verify | IP **and** email | 5 each | `POST /auth/verify-otp` |
+| Forgot password | IP **and** email | 3 each | `POST /auth/forgot-password` |
+| Reset password | IP only | 5 | `POST /auth/reset-password` (token is on the query; no email limiter) |
 | Public | IP only | 100 | `GET /products`, `GET /products/filters`, `GET /products/:slug`, `GET /categories`, `GET /categories/:slug` |
 | Cart | `userId` (after `protect`) | 60 | All `/cart` routes |
 
@@ -2156,7 +2348,7 @@ IP-only limiters omit a custom `keyGenerator`. Passing `(req) => req.ip` throws 
 
 Over limit → `AppError('Too many requests', 429)`.
 
-Redis prefixes: `rl:login:ip:`, `rl:login:email:`, `rl:otp:ip:`, `rl:otp:email:`, `rl:verify:ip:`, `rl:verify:email:`, `rl:public:ip:`, `rl:cart:user:`.
+Redis prefixes: `rl:login:ip:`, `rl:login:email:`, `rl:otp:ip:`, `rl:otp:email:`, `rl:verify:ip:`, `rl:verify:email:`, `rl:forgot:ip:`, `rl:forgot:email:`, `rl:reset:ip:`, `rl:public:ip:`, `rl:cart:user:`.
 
 ---
 
@@ -2166,7 +2358,7 @@ Public **lists** are cached. Single-product / single-category GETs by slug are n
 
 | Route | TTL | Redis key example |
 |-------|-----|-------------------|
-| `GET /products` (+ query string) | 600s | `cache:/products`, `cache:/products?page=2` |
+| `GET /products` (+ query string) | 600s | `cache:/products`, `cache:/products?limit=2&cursor=<id>` |
 | `GET /categories` (+ query string) | 600s | `cache:/categories`, `cache:/categories?parent=null` |
 
 **Read path (`cacheMiddleware`):**
@@ -2187,6 +2379,41 @@ Public **lists** are cached. Single-product / single-category GETs by slug are n
 `await invalidateCache(...)` so the HTTP response is not sent while old keys still exist.
 
 Homepage / top-rated lists were **not** added — there is no `rating` field. `GET /products` + `GET /categories` are the homepage payload.
+
+---
+
+## 📬 Background Jobs
+
+Two Node processes, one Redis:
+
+| Process | Command | Role |
+|---|---|---|
+| API | `npm run dev` / `npm start` | HTTP; `emailQueue.add(...)` only |
+| Worker | `npm run worker` | `emailQueue.process(...)`; Nodemailer |
+
+If the worker is down, jobs sit in Redis (`bull:email:*`). They are not lost. Mail is late; orders stay `PAID`; forgot still 200s. This is **event-driven** (user clicked), not cron (clock). Both stay up 24/7 in production (e.g. two PM2 apps).
+
+**`order-confirmation`** — added only when `capturePayment` actually writes `PAID`. Payload `{ orderId }`. Worker skips if the order is missing or not `PAID`.
+
+**`password-reset`** — added from `forgotPassword` when the user exists. Payload `{ email, token }`. Link: `BASE_URL + '/auth/reset-password?token=' + token`.
+
+Retries: 3, exponential backoff from 2s. After that, `failed` is logged. Order status is never mutated from a job.
+
+OTP email is **not** a job (Week 1–3 path). Same queue could take a third name `otp` later; generate the code in the API so retries resend the same digits.
+
+---
+
+## 📝 Logging
+
+| Piece | Where |
+|---|---|
+| Winston | `src/config/logger.js` — JSON files + color console when `NODE_ENV !== production` |
+| `logs/error.log` | `error` level only |
+| `logs/combined.log` | everything including `http` |
+| Morgan | `dev` locally, `combined` in production; `skip` `/health`; `stream.write` → `logger.http` |
+| Worker | `logger.info` / `logger.error` for starting, completed, failed, queue error |
+
+`level` is `debug` in development and `http` in production (`info` would drop Morgan lines — `http` is a lower npm level).
 
 ---
 
@@ -2311,40 +2538,41 @@ isActive    Boolean     Default: true
 |-----|------|-------|-----|---------|
 | `cart:<userId>` | HASH | field = productId, value = quantity | 7 days, refresh on write | Shopping cart |
 | `otp:<email>` | STRING | SHA-256 of the 6-digit code | 10 minutes | Email verification |
+| `reset:<sha256(token)>` | STRING | email (lowercase) | 15 minutes | Password-reset token |
+| `bull:email:*` | (Bull) | job payloads | until processed / failed | Email queue |
 | `bl:<sha256(accessToken)>` | STRING | `1` | remaining JWT lifetime | Access-token denylist |
 | `rl:<policy>:<identity>:*` | STRING | counter (library-managed) | 15 minutes | Rate-limit buckets |
 | `cache:<originalUrl>` | STRING | JSON success envelope | 10 minutes | GET list responses |
 | `lock:<originalUrl>` | STRING | lock owner UUID | 10 seconds | Stampede: only one miss rebuilds the cache |
 
-Inspect with Memurai CLI (`memurai-cli` on Windows): `HGETALL cart:<userId>`, `TTL otp:<email>`, `GET cache:/products`, `KEYS cache:*`.
+Inspect with Memurai CLI (`memurai-cli` on Windows): `HGETALL cart:<userId>`, `TTL otp:<email>`, `GET cache:/products`, `KEYS cache:*`, `KEYS bull:email:*`.
 
 ---
 
 ## 🔍 Pagination & Filtering
 
-All list endpoints follow a consistent pattern:
+`GET /products` is **cursor-based** (offset `page`/`skip` was removed):
 
 ```
-GET /products?page=2&limit=20&category=<id>&minPrice=10000&maxPrice=80000&search=iphone
+GET /products?limit=20&category=<id>&minPrice=10000&maxPrice=80000&search=iphone
+GET /products?limit=20&category=<id>&cursor=<nextCursor>
 ```
 
-Responses always include a `pagination` object:
 ```json
 {
-  "pagination": {
-    "total": 85,
-    "page": 2,
-    "limit": 20,
-    "totalPages": 5
-  }
+  "products": [ ],
+  "nextCursor": "65f1…",
+  "hasMore": true
 }
 ```
 
-**Built-in protections** (see [`getProducts` internal logic](#productservicegetproductsfilters) for exactly where each is applied):
-- `page` minimum is 1 — negative/zero pages rejected before reaching MongoDB
-- `limit` maximum is 50 — prevents large-payload denial-of-service requests
-- Non-numeric `minPrice`/`maxPrice` returns `400` with a clear message instead of a raw Mongoose `CastError`
-- Invalid category ObjectId format returns `400` before it's used in any query
+**Why no `total` / `totalPages`:** counting every match on a large catalog is the expensive part cursors exist to skip. “Load more” only needs `hasMore`.
+
+**Built-in protections** (see [`getProducts` internal logic](#productservicegetproductsfilters)):
+- `limit` clamped 1–50
+- Invalid `cursor` → `400 Invalid cursor` before Mongo
+- Non-numeric `minPrice`/`maxPrice` → `400` instead of a raw Mongoose `CastError`
+- Sort is always `{ _id: -1 }` so `$lt` cursor is well-defined
 
 ---
 
@@ -2425,13 +2653,22 @@ npm run seed
 ```
 
 ### 7. Start Redis
-Memurai (Windows) or `redis-server` must be running on `localhost:6379` before `npm run dev`. Cart, OTP, blacklist, and rate limits all need it. `server.js` connects Redis **before** loading Express so the rate-limit store is not created against a closed client.
+Memurai (Windows) or `redis-server` must be running on `localhost:6379` before `npm run dev`. Cart, OTP, reset tokens, blacklist, rate limits, cache, **and Bull** all need it. `server.js` connects Redis **before** loading Express so the rate-limit store is not created against a closed client.
 
-### 8. Start the server
+### 8. Start the API **and** the worker
+Two terminals whenever you test mail:
+
 ```bash
-npm run dev       # Development (with hot reload)
-npm start         # Production
+npm run dev          # HTTP (Helmet, CORS, Morgan)
+npm run worker       # Bull consumers — prints "Email worker starting"
 ```
+
+```bash
+npm start            # Production API
+npm run worker       # Production worker (leave it up 24/7 with the API)
+```
+
+Without the worker, jobs wait in Redis; forgot still 200s and paid orders stay `PAID`, but no mail goes out.
 
 ### .env.example
 ```env
@@ -2456,9 +2693,19 @@ CLOUDINARY_CLOUD_NAME=your_cloud_name
 CLOUDINARY_API_KEY=your_api_key
 CLOUDINARY_API_SECRET=your_api_secret
 
-# Gmail (OTP) — App Password, 16 characters, no spaces
+# Gmail (OTP + jobs) — App Password, 16 characters, no spaces
 EMAIL_USER=youremail@gmail.com
 EMAIL_PASS=abcdefghijklmnop
+
+# Public origin for reset links (no trailing slash)
+BASE_URL=http://localhost:3000
+
+# Browser origins allowed to call this API (comma-separated)
+CORS_ORIGINS=http://localhost:3000,http://localhost:5173
+
+# Optional — Bull ioredis (defaults 127.0.0.1:6379)
+# REDIS_HOST=127.0.0.1
+# REDIS_PORT=6379
 
 # Razorpay (test keys — never commit secrets)
 RAZORPAY_KEY_ID=rzp_test_xxx
@@ -2492,9 +2739,24 @@ curl -X POST http://localhost:3000/auth/login \
   -d '{"email":"sahil@example.com","password":"password123"}'
 ```
 
-**Get Products with filters:**
+**Forgot password:**
 ```bash
-curl "http://localhost:3000/products?category=<id>&minPrice=50000&maxPrice=150000&page=1"
+curl -X POST http://localhost:3000/auth/forgot-password \
+  -H "Content-Type: application/json" \
+  -d '{"email":"sahil@example.com"}'
+```
+
+**Reset password** (POST the link from the email; token is on the query):
+```bash
+curl -X POST "http://localhost:3000/auth/reset-password?token=<hex>" \
+  -H "Content-Type: application/json" \
+  -d '{"password":"newpass12"}'
+```
+
+**Get Products with filters + cursor:**
+```bash
+curl "http://localhost:3000/products?category=<id>&minPrice=50000&limit=20"
+curl "http://localhost:3000/products?category=<id>&limit=20&cursor=<nextCursor>"
 ```
 
 **Get Dynamic Filters:**
@@ -2706,6 +2968,32 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 - **`getOrders` called `getOrder`** — one-order function without `orderId` → 404. Controller must call `getOrders` (with **s**)
 - **`order.userId !== orderId`** — compared user uuid to order uuid; 403 on your own order. Compare to `userId`
 - **PUT `isDefault: false` on the default** — left zero defaults until promote-another was added (same idea as delete-default)
+
+### Week 6 — Jobs, Helmet, CORS, Zod leftovers, Cursor, Logs
+
+**Engineering Concepts:**
+- **Jobs vs request** — slow/flaky work (`sendMail`) is `emailQueue.add` + a worker. HTTP stays fast. Redis holds the list if either process restarts
+- **Two processes** — crash isolation and independent scale. `queue.js` never calls `.process()` so the API cannot consume jobs by accident
+- **PAID stays PAID** — email is not payment truth. Retries + `failed` log; no order status change
+- **Enqueue on state change** — only the `PENDING` → `PAID` branch adds `order-confirmation` so verify + webhook do not double-mail
+- **One queue, two names** — `order-confirmation` and `password-reset` share retries and the failed list
+- **Reset token by hash** — `reset:<sha256>` → email so the URL is `?token=` only. 15 min TTL, one-shot `DEL`, `deleteMany` refresh tokens
+- **Forgot always 200** — same enumeration guard as `sendOtp`
+- **`BASE_URL` origin** — path is code; one env for every future link
+- **Helmet + CORS whitelist** — headers on every response; `credentials: true` because of the refresh cookie; no `Origin` still allowed
+- **Zod strip** — `z.object` keeps listed keys so `findByIdAndUpdate` cannot take `slug` / `image`. `updateProductSchema = createProductSchema.partial()`
+- **Reset Zod in the controller** — `validate()` is body-only; the mail link puts the token on the query
+- **Cursor pagination** — `$lt` + `sort _id -1` + `limit+1`. No skip, no count. Cache key still includes `cursor`
+- **Morgan → Winston** — one logger; `errorHandler` logs **before** the dev `return`; never log bodies
+
+**Challenges Faced:**
+- **`on('ready')` never fired** — Bull + ioredis 6. Immediate `console.log` / `logger.info('Email worker starting')` plus `completed` / `failed`
+- **Successful jobs were silent** — only `failed` was hooked; add `completed` (log email/orderId, never the token)
+- **Route `validate` on reset 400'd pasted links** — token on `req.query`; merge in the controller
+- **`resetPasswordSchema` used without import** when parsing in the controller
+- **`logger.error` after development `return`** — 400s never hit `logs/error.log`. Log first
+- **Winston `simple()` extra `{"timestamp"}`** — logger format adds timestamp; console `simple()` prints leftover keys. Cosmetic
+- **OTP still sync** — left on purpose (built before the queue); not a third job this week
 
 ---
 
