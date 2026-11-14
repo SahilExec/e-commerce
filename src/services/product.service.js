@@ -57,11 +57,80 @@ const createProduct = async (productData) => {
     return product
 }
 
+// With offset pagination 
+// const getProducts = async (filters) => {
+
+//     const { category, search, attributeKey, attributeValue, minPrice, maxPrice, page = 1, limit = 10 } = filters
+
+//     // build query object dynamically
+//     const query = { isActive: true }
+
+//     if (category) {
+//         query.categoryPath = {
+//             $in: [new mongoose.Types.ObjectId(category)]
+//         }
+//     }
+
+//     if (search) {
+//         query.name = { $regex: search, $options: 'i' }
+//     }
+
+//     if (minPrice && isNaN(Number(minPrice))) {
+//         throw new AppError('minPrice must be a number', 400)
+//     }
+//     if (maxPrice && isNaN(Number(maxPrice))) {
+//         throw new AppError('maxPrice must be a number', 400)
+//     }
+
+//     if (minPrice || maxPrice) {
+//         query.price = {}
+
+//         if (minPrice) {
+//             query.price.$gte = Number(minPrice)
+//         }
+
+//         if (maxPrice) {
+//             query.price.$lte = Number(maxPrice)
+//         }
+//     }
+
+//     if (attributeKey && attributeValue) {
+//         query.attributes = {
+//             $elemMatch: {
+//                 key: attributeKey,
+//                 value: attributeValue
+//             }
+//         }
+//     }
+
+//     const pageNum = Math.max(1, Number(page))  // minimum page is 1
+//     const skip = (pageNum - 1) * limit
+
+//     const limitNum = Math.min(Number(limit), 50)  // max 50 per page
+
+//     const [products, total] = await Promise.all([
+//         Product.find(query).populate('category', 'name slug').skip(skip).limit(limitNum),
+//         Product.countDocuments(query)
+//     ])
+
+
+//     return {
+//         products,
+//         pagination: {
+//             total,
+//             page: pageNum,
+//             limit: limitNum,
+//             totalPages: Math.ceil(total / limit)
+//         }
+//     }
+// }
+
+
+// With Cursor-based pagination
 const getProducts = async (filters) => {
 
-    const { category, search, attributeKey, attributeValue, minPrice, maxPrice, page = 1, limit = 10 } = filters
+    const { category, search, attributeKey, attributeValue, minPrice, maxPrice, cursor, limit = 10 } = filters
 
-    // build query object dynamically
     const query = { isActive: true }
 
     if (category) {
@@ -102,25 +171,30 @@ const getProducts = async (filters) => {
         }
     }
 
-    const pageNum = Math.max(1, Number(page))  // minimum page is 1
-    const skip = (pageNum - 1) * limit
+    if (cursor) {
+        if (!mongoose.Types.ObjectId.isValid(cursor)) {
+            throw new AppError('Invalid cursor', 400)
+        }
+        query._id = { $lt: new mongoose.Types.ObjectId(cursor) }
+    }
 
-    const limitNum = Math.min(Number(limit), 50)  // max 50 per page
+    const limitNum = Math.min(Math.max(1, Number(limit) || 10), 50)
 
-    const [products, total] = await Promise.all([
-        Product.find(query).populate('category', 'name slug').skip(skip).limit(limitNum),
-        Product.countDocuments(query)
-    ])
+    const rows = await Product.find(query)
+        .populate('category', 'name slug')
+        .sort({ _id: -1 })
+        .limit(limitNum + 1)
 
+    const hasMore = rows.length > limitNum
+    const products = hasMore ? rows.slice(0, limitNum) : rows
+    const nextCursor = hasMore
+        ? products[products.length - 1]._id.toString()
+        : null
 
     return {
         products,
-        pagination: {
-            total,
-            page: pageNum,
-            limit: limitNum,
-            totalPages: Math.ceil(total / limit)
-        }
+        nextCursor,
+        hasMore
     }
 }
 

@@ -22,6 +22,9 @@ const paymentRoutes = require('./routes/payment.routes')
 
 const errorHandler = require('./middlewares/errorHandler');
 
+const morgan = require('morgan')
+const logger = require('./config/logger')
+
 const app = express();
 
 const allowedOrigins = (process.env.CORS_ORIGINS || '')
@@ -43,6 +46,14 @@ app.use(cors({
     },
     credentials: true
 }))
+
+app.use(morgan(
+    process.env.NODE_ENV === 'production' ? 'combined' : 'dev',
+    {
+        skip: (req) => req.path === '/health',
+        stream: { write: (msg) => logger.http(msg.trim()) }
+    }
+))
 
 app.use(express.json({
     verify: (req, res, buf) => {

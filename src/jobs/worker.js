@@ -1,3 +1,5 @@
+const logger = require('../config/logger')
+
 require('dotenv').config()
 
 const emailQueue = require('./queue')
@@ -6,10 +8,10 @@ const { processOrderConfirmation, processPasswordReset } = require('./email.proc
 emailQueue.process('order-confirmation', processOrderConfirmation)
 emailQueue.process('password-reset', processPasswordReset)
 
-console.log('Email worker starting')
+logger.info('Email worker starting')
 
 emailQueue.on('completed', (job) => {
-    console.log('Job completed', {
+    logger.info('Job completed', {
         id: job && job.id,
         name: job && job.name,
         orderId: job && job.data && job.data.orderId,
@@ -18,7 +20,7 @@ emailQueue.on('completed', (job) => {
 })
 
 emailQueue.on('failed', (job, err) => {
-    console.error('Job failed', {
+    logger.error('Job failed', {
         id: job && job.id,
         name: job && job.name,
         attemptsMade: job && job.attemptsMade,
@@ -29,5 +31,5 @@ emailQueue.on('failed', (job, err) => {
 })
 
 emailQueue.on('error', (err) => {
-    console.error('Queue error', err.message)
+    logger.error('Queue error', { message: err.message })
 })
