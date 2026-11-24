@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="EB">
+  <rect width="32" height="32" rx="8" fill="#0b0b0a"/>
+  <g fill="#e0b15a">
+    <rect x="5.4" y="8" width="2.5" height="16"/>
+    <rect x="5.4" y="8" width="8.5" height="2.5"/>
+    <rect x="5.4" y="14.75" width="7" height="2.5"/>
+    <rect x="5.4" y="21.5" width="8.5" height="2.5"/>
+    <path fill-rule="evenodd" d="M16.3 8h6.45c2.4 0 4.35 1.75 4.35 4.05 0 1.75-1.05 3.15-2.6 3.7 1.85.5 3.15 2 3.15 4.05 0 2.4-2.1 4.2-4.75 4.2H16.3V8zm2.5 2.4v3.3h3.4c1.15 0 1.95-.75 1.95-1.65s-.8-1.65-1.95-1.65H18.8zm0 5.95V21.6h3.85c1.35 0 2.3-.85 2.3-2.05s-.95-2.2-2.3-2.2H18.8z"/>
+  </g>
+</svg>

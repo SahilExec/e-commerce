@@ -1,0 +1,1246 @@
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Process health
+      security: []
+      responses:
+        '200':
+          description: API process is up
+          content:
+            application/json:
+              example:
+                status: ok
+                message: Server is running
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Register
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterBody'
+            example:
+              name: Sahil
+              email: you@example.com
+              password: password12
+      responses:
+        '201':
+          description: User created (password omitted). OTP email is attempted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessUser'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '409':
+          description: Email already registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/send-otp:
+    post:
+      tags: [Auth]
+      summary: Send verification OTP
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailBody'
+      responses:
+        '200':
+          description: Always 200 if the body is valid. Unknown emails do not error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /auth/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Verify email OTP
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VerifyOtpBody'
+            example:
+              email: you@example.com
+              otp: '123456'
+      responses:
+        '200':
+          description: User marked verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessUser'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Login
+      description: Returns accessToken in JSON. Sets httpOnly cookie `refreshToken` (7 days, SameSite=strict).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginBody'
+            example:
+              email: you@example.com
+              password: password12
+      responses:
+        '200':
+          description: Access token issued; refresh cookie set
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessAccessToken'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '403':
+          description: Email not verified
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                success: false
+                message: Please verify your email
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      summary: Current user
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: User without password
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessUser'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/refresh-token:
+    post:
+      tags: [Auth]
+      summary: Rotate refresh cookie, issue new access token
+      description: Reads `refreshToken` httpOnly cookie. No Bearer header. Rotates the cookie.
+      security:
+        - cookieAuth: []
+      responses:
+        '200':
+          description: New access token; new refresh cookie
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessAccessToken'
+        '401':
+          description: Missing or invalid refresh cookie
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Logout
+      description: Requires Bearer access token and the refresh cookie. Blacklists the access token and deletes the refresh row. Clears the cookie.
+      security:
+        - bearerAuth: []
+          cookieAuth: []
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/forgot-password:
+    post:
+      tags: [Auth]
+      summary: Request password reset
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmailBody'
+      responses:
+        '200':
+          description: Always 200 if the body is valid. Unknown emails do not enqueue mail.
+          content:
+            application/json:
+              example:
+                success: true
+                message: If that email exists, we sent a reset token
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /auth/reset-password:
+    post:
+      tags: [Auth]
+      summary: Set a new password
+      description: Token may be on the query string (mail link) or in the JSON body. Password is always in the body.
+      security: []
+      parameters:
+        - in: query
+          name: token
+          schema:
+            type: string
+          description: Reset token from the email link
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                token:
+                  type: string
+                password:
+                  type: string
+                  minLength: 8
+            example:
+              password: newpass12
+      responses:
+        '200':
+          description: Password updated; all refresh sessions deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /products:
+    get:
+      tags: [Products]
+      summary: List products (cursor pagination)
+      security: []
+      parameters:
+        - in: query
+          name: category
+          schema: { type: string }
+          description: Mongo ObjectId matched against categoryPath
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: attributeKey
+          schema: { type: string }
+        - in: query
+          name: attributeValue
+          schema: { type: string }
+        - in: query
+          name: minPrice
+          schema: { type: number }
+        - in: query
+          name: maxPrice
+          schema: { type: number }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: Last product _id from the previous page
+        - in: query
+          name: limit
+          schema: { type: integer, default: 10, minimum: 1, maximum: 50 }
+      responses:
+        '200':
+          description: Page of products
+          content:
+            application/json:
+              example:
+                success: true
+                data:
+                  products: []
+                  nextCursor: null
+                  hasMore: false
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooMany'
+    post:
+      tags: [Products]
+      summary: Create product (ADMIN)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductBody'
+            example:
+              name: Wireless Mouse
+              description: Optical mouse with USB receiver
+              price: 499
+              quantity: 20
+              category: 65f1a2b3c4d5e6f7a8b9c0d1
+              attributes:
+                - key: color
+                  value: black
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /products/filters:
+    get:
+      tags: [Products]
+      summary: Attribute filters for a category
+      security: []
+      parameters:
+        - in: query
+          name: category
+          required: true
+          schema: { type: string }
+          description: Mongo ObjectId
+      responses:
+        '200':
+          description: Distinct attribute keys and values
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /products/{slug}:
+    get:
+      tags: [Products]
+      summary: Get product by slug
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+      responses:
+        '200':
+          description: Product
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /products/{id}:
+    put:
+      tags: [Products]
+      summary: Update product (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MongoId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductBodyPartial'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Products]
+      summary: Delete product (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MongoId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              example:
+                success: true
+                message: Product deleted successfully
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /products/{id}/images:
+    post:
+      tags: [Products]
+      summary: Upload product image (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MongoId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Image attached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          description: No image or not an image file
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /categories:
+    get:
+      tags: [Categories]
+      summary: List active categories
+      security: []
+      parameters:
+        - in: query
+          name: parent
+          schema: { type: string }
+          description: '`null` for top-level, or a 24-char parent ObjectId'
+      responses:
+        '200':
+          description: Category list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '429':
+          $ref: '#/components/responses/TooMany'
+    post:
+      tags: [Categories]
+      summary: Create category (ADMIN)
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryBody'
+            example:
+              name: Phones
+              description: Mobile phones
+              parent: null
+      responses:
+        '201':
+          description: Created (slug generated from name)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /categories/{slug}:
+    get:
+      tags: [Categories]
+      summary: Get category by slug
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/Slug'
+      responses:
+        '200':
+          description: Category
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /categories/{id}:
+    put:
+      tags: [Categories]
+      summary: Update category (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MongoId'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryBodyPartial'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Categories]
+      summary: Delete category (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MongoId'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              example:
+                success: true
+                message: Category deleted successfully
+        '400':
+          description: Category still has active products
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                success: false
+                message: Cannot delete category with active products
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /categories/{id}/image:
+    post:
+      tags: [Categories]
+      summary: Upload category image (ADMIN)
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MongoId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [image]
+              properties:
+                image:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Image attached
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          description: No image provided
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /cart:
+    get:
+      tags: [Cart]
+      summary: Get cart
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Cart with line totals
+          content:
+            application/json:
+              example:
+                success: true
+                data:
+                  items: []
+                  total: 0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooMany'
+    delete:
+      tags: [Cart]
+      summary: Clear cart
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Empty cart
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /cart/add:
+    post:
+      tags: [Cart]
+      summary: Add or increment item
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [productId, quantity]
+              properties:
+                productId:
+                  type: string
+                  minLength: 24
+                  maxLength: 24
+                quantity:
+                  type: integer
+                  minimum: 1
+                  maximum: 20
+            example:
+              productId: 65f1a2b3c4d5e6f7a8b9c0d1
+              quantity: 1
+      responses:
+        '200':
+          description: Cart items
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /cart/items/{id}:
+    delete:
+      tags: [Cart]
+      summary: Remove one product from cart
+      description: Path `id` is the Mongo productId.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/MongoId'
+      responses:
+        '200':
+          description: Updated cart
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Item not in cart
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          $ref: '#/components/responses/TooMany'
+
+  /addresses:
+    get:
+      tags: [Addresses]
+      summary: List my addresses
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Address array
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Addresses]
+      summary: Create address
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressBody'
+            example:
+              fullName: Sahil
+              phone: '9876543210'
+              line1: 12 MG Road
+              city: Pune
+              state: Maharashtra
+              pincode: '411001'
+              isDefault: true
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Default-address unique conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /addresses/{id}:
+    put:
+      tags: [Addresses]
+      summary: Update address
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Uuid'
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressBodyPartial'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Default-address unique conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Addresses]
+      summary: Delete address
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Uuid'
+      responses:
+        '200':
+          description: Deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Default-address unique conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /addresses/{id}/default:
+    patch:
+      tags: [Addresses]
+      summary: Set default address
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Uuid'
+      responses:
+        '200':
+          description: This address is now default
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Default-address unique conflict
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /orders/checkout:
+    post:
+      tags: [Orders]
+      summary: Checkout cart
+      description: Deducts Mongo stock, creates PENDING order + Razorpay order, clears cart. Snapshots address and line items.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [addressId]
+              properties:
+                addressId:
+                  type: string
+                  format: uuid
+            example:
+              addressId: 3fa85f64-5717-4562-b3fc-2c963f66afa6
+      responses:
+        '201':
+          description: Order created (PENDING)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          description: Empty cart, invalid UUID, or not enough stock
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders:
+    get:
+      tags: [Orders]
+      summary: List my orders
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Orders
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /orders/{id}:
+    get:
+      tags: [Orders]
+      summary: Get one order
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Uuid'
+      responses:
+        '200':
+          description: Order
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /orders/{id}/cancel:
+    post:
+      tags: [Orders]
+      summary: Cancel order
+      description: PENDING restores stock. PAID starts a refund; stock returns when Razorpay sends refund.processed.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Uuid'
+      responses:
+        '200':
+          description: Cancelled or refund initiated
+          content:
+            application/json:
+              examples:
+                pending:
+                  value:
+                    success: true
+                    message: Order cancelled
+                paid:
+                  value:
+                    success: true
+                    message: Refund initiated, this may take a few days
+                    payment: {}
+        '400':
+          description: Order is not PENDING or PAID, or was already processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /payments/verify:
+    post:
+      tags: [Payments]
+      summary: Verify Checkout HMAC and capture
+      description: Idempotent. First success sets payment CAPTURED and order PAID, then enqueues confirmation mail.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [razorpay_order_id, razorpay_payment_id, razorpay_signature]
+              properties:
+                razorpay_order_id: { type: string }
+                razorpay_payment_id: { type: string }
+                razorpay_signature: { type: string }
+      responses:
+        '200':
+          description: Captured (or already captured)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SuccessData'
+        '400':
+          description: Zod failure or invalid HMAC
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /payments/webhook:
+    post:
+      tags: [Payments]
+      summary: Razorpay webhook
+      description: Verifies `x-razorpay-signature` against the raw JSON body. Handles payment.captured and refund.processed. Do not call this from a browser.
+      security: []
+      parameters:
+        - in: header
+          name: x-razorpay-signature
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: true
+      responses:
+        '200':
+          description: Acknowledged
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Success'
+        '400':
+          description: Missing or invalid signature
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: "Access token from POST /auth/login. Send as Authorization Bearer token."
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: refreshToken
+      description: httpOnly cookie set by login and refresh. Required by refresh-token and logout.
+  parameters:
+    Slug:
+      in: path
+      name: slug
+      required: true
+      schema: { type: string }
+    MongoId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, minLength: 24, maxLength: 24 }
+    Uuid:
+      in: path
+      name: id
+      required: true
+      schema: { type: string, format: uuid }
+
+  schemas:
+    Success:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+    SuccessData:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data: {}
+    SuccessUser:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          $ref: '#/components/schemas/UserPublic'
+    SuccessAccessToken:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        data:
+          type: object
+          properties:
+            accessToken: { type: string }
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+    UserPublic:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        email: { type: string }
+        role: { type: string, enum: [CUSTOMER, ADMIN] }
+        isVerified: { type: boolean }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+    RegisterBody:
+      type: object
+      required: [name, email, password]
+      properties:
+        name: { type: string, minLength: 2 }
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+    LoginBody:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 8 }
+    EmailBody:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email }
+    VerifyOtpBody:
+      type: object
+      required: [email, otp]
+      properties:
+        email: { type: string, format: email }
+        otp: { type: string, pattern: '^\d{6}$' }
+    ProductBody:
+      type: object
+      required: [name, description, price, quantity, category]
+      properties:
+        name: { type: string, minLength: 2 }
+        description: { type: string, minLength: 10 }
+        price: { type: number, exclusiveMinimum: 0 }
+        quantity: { type: integer, minimum: 0 }
+        category: { type: string, minLength: 24, maxLength: 24 }
+        attributes:
+          type: array
+          items:
+            type: object
+            properties:
+              key: { type: string }
+              value: {}
+    ProductBodyPartial:
+      type: object
+      properties:
+        name: { type: string, minLength: 2 }
+        description: { type: string, minLength: 10 }
+        price: { type: number, exclusiveMinimum: 0 }
+        quantity: { type: integer, minimum: 0 }
+        category: { type: string, minLength: 24, maxLength: 24 }
+        attributes:
+          type: array
+          items:
+            type: object
+    CategoryBody:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, minLength: 2 }
+        description: { type: string }
+        parent:
+          type: string
+          nullable: true
+          minLength: 24
+          maxLength: 24
+    CategoryBodyPartial:
+      type: object
+      properties:
+        name: { type: string, minLength: 2 }
+        description: { type: string }
+        parent:
+          type: string
+          nullable: true
+    AddressBody:
+      type: object
+      required: [fullName, phone, line1, city, state, pincode]
+      properties:
+        fullName: { type: string, minLength: 2 }
+        phone: { type: string, pattern: '^\d{10}$' }
+        line1: { type: string, minLength: 3 }
+        line2: { type: string }
+        city: { type: string, minLength: 2 }
+        state: { type: string, minLength: 2 }
+        pincode: { type: string, pattern: '^\d{6}$' }
+        isDefault: { type: boolean }
+    AddressBodyPartial:
+      type: object
+      properties:
+        fullName: { type: string }
+        phone: { type: string }
+        line1: { type: string }
+        line2: { type: string }
+        city: { type: string }
+        state: { type: string }
+        pincode: { type: string }
+        isDefault: { type: boolean }
+
+  responses:
+    BadRequest:
+      description: Validation or client error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing, expired, or revoked Bearer token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    TooMany:
+      description: Rate limit
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
