@@ -1,3 +1,8 @@
+if (require.main === module) {
+    require('dotenv').config()
+    require('../config/env')
+}
+
 const logger = require('../config/logger')
 
 const emailQueue = require('./queue')
@@ -40,7 +45,5 @@ function startEmailWorker() {
 module.exports = startEmailWorker
 
 if (require.main === module) {
-    require('dotenv').config()
-    require('../config/env')
     startEmailWorker()
 }

@@ -1,6 +1,9 @@
 const required = [
+    'NODE_ENV',
+    'RUN_WORKER_IN_PROCESS',
     'DATABASE_URL',
     'MONGODB_URI',
+    'REDIS_URL',
     'ACCESS_TOKEN_SECRET',
     'REFRESH_TOKEN_SECRET',
     'EMAIL_USER',
