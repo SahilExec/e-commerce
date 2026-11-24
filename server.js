@@ -14,6 +14,9 @@ Promise.all([
     const app = require('./src/app')
     app.listen(PORT, () => {
         console.log(`Server running on port ${PORT}`)
+        if (process.env.RUN_WORKER_IN_PROCESS === 'true') {
+            require('./src/jobs/worker')()
+        }
     })
 }).catch((err) => {
     console.error('Connection failed:', err.message)
