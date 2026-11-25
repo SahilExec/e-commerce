@@ -30,6 +30,10 @@ const logger = require('./config/logger')
 const swaggerUi = require('swagger-ui-express')
 const swaggerSpec = require('./docs/swagger')
 
+const mongoose = require('mongoose')
+const prisma = require('./config/prisma')
+const { redisClient } = require('./config/redis')
+
 const app = express();
 
 app.set('trust proxy', 1)
@@ -57,7 +61,7 @@ app.use(cors({
 app.use(morgan(
     process.env.NODE_ENV === 'production' ? 'combined' : 'dev',
     {
-        skip: (req) => req.path === '/health',
+        skip: (req) => req.path === '/health' || req.path === '/ready',
         stream: { write: (msg) => logger.http(msg.trim()) }
     }
 ))
@@ -72,6 +76,13 @@ app.use(cookieParser())
 
 app.get('/health' , (req, res) => {
     res.json({status: 'ok', message: 'Server is running'})
+})
+
+app.get('/ready', async (req, res) => {
+    await mongoose.connection.db.admin().command({ ping: 1 })
+    await redisClient.ping()
+    await prisma.$queryRaw`SELECT 1`
+    res.json({ status: 'ok' })
 })
 
 app.use(

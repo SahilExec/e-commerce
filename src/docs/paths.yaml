@@ -13,6 +13,19 @@ paths:
                 status: ok
                 message: Server is running
 
+  /ready:
+    get:
+      tags: [Health]
+      summary: Ping Mongo, Redis, and Postgres
+      security: []
+      responses:
+        '200':
+          description: Stores answered
+          content:
+            application/json:
+              example:
+                status: ok
+
   /auth/register:
     post:
       tags: [Auth]
