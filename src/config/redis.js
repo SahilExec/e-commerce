@@ -5,6 +5,8 @@ const redisClient = createClient({
     url: process.env.REDIS_URL,
     pingInterval: 30000,
     socket: {
+        connectTimeout: 10000,
+        family: 4,
         reconnectStrategy: (retries) => Math.min(retries * 50, 2000)
     }
 })
@@ -14,6 +16,7 @@ redisClient.on('error', (err) => {
 })
 
 const connectRedis = async () => {
+    console.log('Connecting to Redis...')
     await redisClient.connect()
     console.log('Redis connected')
 }

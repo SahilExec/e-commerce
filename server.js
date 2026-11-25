@@ -12,7 +12,7 @@ Promise.all([
     connectRedis()
 ]).then(() => {
     const app = require('./src/app')
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
         console.log(`Server running on port ${PORT}`)
         if (process.env.RUN_WORKER_IN_PROCESS === 'true') {
             require('./src/jobs/worker')()
