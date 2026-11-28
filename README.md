@@ -4,37 +4,29 @@ A production-grade, scalable e-commerce REST API built with Node.js, Express, Po
 
 > **Open Source for Frontend Developers** — This is a backend-only project. Frontend developers can build full-featured e-commerce applications on top of this API without worrying about backend complexity.
 
+| | |
+|---|---|
+| **Live** | [e-commerce-backend-iea3.onrender.com](https://e-commerce-backend-iea3.onrender.com) |
+| **Swagger** | [/api-docs](https://e-commerce-backend-iea3.onrender.com/api-docs) |
+| **Health** | [/health](https://e-commerce-backend-iea3.onrender.com/health) · [/ready](https://e-commerce-backend-iea3.onrender.com/ready) |
+| **Postman** | [`docs/postman/ecommerce.postman_collection.json`](docs/postman/ecommerce.postman_collection.json) |
+
 ---
 
 ## 📌 Table of Contents
 
-- [Project Overview](#-project-overview)
-- [Key Features](#-key-features)
-- [Tech Stack](#-tech-stack)
-- [Architecture & Design Decisions](#-architecture--design-decisions)
-- [Project Structure](#-project-structure)
-- [API Overview](#-api-overview)
-- [Authentication Flow](#-authentication-flow)
-- [API Reference](#-api-reference)
-  - [Auth Module](#auth-module)
-  - [Cart Module](#cart-module)
-  - [Address Module](#address-module)
-  - [Product Module](#product-module)
-  - [Category Module](#category-module)
-  - [Orders Module](#orders-module)
-  - [Payments Module](#payments-module)
-- [Function & Middleware Reference](#-function--middleware-reference)
-- [Rate Limiting](#-rate-limiting)
-- [Response Caching](#-response-caching)
-- [Background Jobs](#-background-jobs)
-- [Logging](#-logging)
-- [Database Schema](#-database-schema)
-- [Pagination & Filtering](#-pagination--filtering)
-- [Error Handling](#-error-handling)
-- [Setup Instructions](#️-setup-instructions)
-- [API Testing](#-api-testing)
-- [What I Learned](#-what-i-learned)
-- [Contributing](#-contributing)
+| Start here | API | Internals | Run |
+|---|---|---|---|
+| [Overview](#-project-overview) | [API overview](#-api-overview) | [Functions](#-function--middleware-reference) | [Setup](#️-setup-instructions) |
+| [Features](#-key-features) | [Auth flow](#-authentication-flow) | [Rate limiting](#-rate-limiting) | [Docker](#-docker) |
+| [Tech stack](#-tech-stack) | [Health](#health) | [Cache](#-response-caching) | [Deploy](#-deploy-render) |
+| [Architecture](#-architecture--design-decisions) | [Auth](#auth-module) | [Jobs](#-background-jobs) | [Testing](#-api-testing) |
+| [Project structure](#-project-structure) | [Cart](#cart-module) | [Logging](#-logging) | [What I learned](#-what-i-learned) |
+| | [Address](#address-module) | [Schema](#-database-schema) | [Contributing](#-contributing) |
+| | [Product](#product-module) | [Pagination](#-pagination--filtering) | |
+| | [Category](#category-module) | [Errors](#-error-handling) | |
+| | [Orders](#orders-module) | | |
+| | [Payments](#payments-module) | | |
 
 ---
 
@@ -54,6 +46,17 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 ---
 
 ## ✨ Key Features
+
+| Area | In short |
+|---|---|
+| Auth | JWT access + httpOnly refresh, OTP, forgot/reset, roles, Helmet, CORS, rate limits |
+| Catalog | Nested categories, attributes, Cloudinary, cursor lists, Redis cache |
+| Cart | Redis hash, live Mongo prices, empty cart `200` |
+| Orders | Addresses, checkout snapshots, atomic stock, Razorpay, cancel/refund |
+| Jobs | Bull confirmation + reset mail (`RUN_WORKER_IN_PROCESS`) |
+| Ops | `/health` + `/ready`, Docker, Swagger, Render |
+
+Full list below.
 
 ### Authentication & Security
 - JWT-based authentication with **access + refresh token** strategy
@@ -107,7 +110,12 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 - Global error handling with `AppError` class (operational vs programmer errors)
 - `asyncHandler` wrapper — zero try/catch repetition across controllers
 - **Zod** schema validation as reusable middleware on every JSON body (reset is the one exception: token lives on the query, so Zod runs in the controller)
-- **Bull** email queue — API `add`s; a second process (`npm run worker`) sends mail
+- **Bull** email queue — API `add`s; consumers run **inside the API** when `RUN_WORKER_IN_PROCESS=true` (Render free / `npm run dev` / Compose). Set `false` and run `npm run worker` for a second process
+- **OpenAPI 3 + Swagger UI** at `/api-docs`; Postman collection at `docs/postman/ecommerce.postman_collection.json`
+- **Landing page** at `/`; **GET `/health`** (process); **GET `/ready`** (Mongo + Redis + Postgres pings)
+- **Docker Compose** — Postgres 16, Mongo 7, Redis 7, API (`node server.js` includes the worker)
+- **Startup env check** — `src/config/env.js` exits if a required variable is missing
+- **`trust proxy`** — real client IP and HTTPS behind Render
 - **Morgan → Winston** — HTTP access lines at `http` level; `errorHandler` logs message/stack/path **before** the response
 - Environment-aware error responses (full stack trace in dev, safe messages in prod)
 
@@ -143,6 +151,8 @@ Most e-commerce tutorials either oversimplify the backend or rely on third-party
 | File Upload | Multer + Cloudinary | Image handling and CDN delivery |
 | Fake Data | @faker-js/faker | Realistic seed data generation |
 | Payments | Razorpay | Orders, Checkout verify, webhooks, refunds |
+| Docs | swagger-jsdoc + swagger-ui-express | OpenAPI 3 UI at `/api-docs` |
+| Containers | Docker Compose | Local Postgres, Mongo, Redis, API |
 
 ---
 
@@ -163,155 +173,376 @@ This separation means business logic is fully reusable — callable from REST ro
 
 ### Key Engineering Decisions
 
-**Why JWT over Sessions?**
+<details>
+<summary>Why JWT over Sessions?</summary>
+
 Sessions require server-side state and a shared session store across instances — a scalability problem. JWTs are stateless and verifiable by any server instance using the shared secret.
 
-**Why Access Token + Refresh Token?**
+</details>
+
+<details>
+<summary>Why Access Token + Refresh Token?</summary>
+
 A single long-lived token can't be revoked if stolen. Short-lived access tokens (15 min) limit the damage window. Refresh tokens (7 days) are stored in the database, making them revocable — logout actually works.
 
-**Why store Refresh Tokens hashed?**
+</details>
+
+<details>
+<summary>Why store Refresh Tokens hashed?</summary>
+
 If the database is compromised, plain-text refresh tokens give attackers 7-day session access for every user. SHA-256 hashed tokens are useless without the originals.
 
-**Why HTTP-only cookies for Refresh Tokens?**
+</details>
+
+<details>
+<summary>Why HTTP-only cookies for Refresh Tokens?</summary>
+
 `localStorage` is readable by any JavaScript on the page — XSS attacks can steal tokens. HTTP-only cookies are invisible to JavaScript; only the browser sends them.
 
-**Why PostgreSQL for users, MongoDB for products?**
+</details>
+
+<details>
+<summary>Why PostgreSQL for users, MongoDB for products?</summary>
+
 Users and refresh tokens have strict relational structure and benefit from ACID transactions. Products have variable attributes (a phone has RAM, a shirt has size) — MongoDB's flexible document model handles this naturally without sparse columns or complex joins.
 
-**Why key-value pairs for product attributes instead of a mixed object?**
+</details>
+
+<details>
+<summary>Why key-value pairs for product attributes instead of a mixed object?</summary>
+
 A free-form `Mixed` type in Mongoose can't be indexed, can't be queried by a specific attribute, and gives no structure for building a frontend filter UI. A key-value array `[{ key: "ram", value: "8GB" }]` is indexable, queryable with `$elemMatch`, and enables dynamic filter generation via aggregation.
 
-**Why materialized path for category hierarchy?**
+</details>
+
+<details>
+<summary>Why materialized path for category hierarchy?</summary>
+
 Filtering products by a parent category (e.g. "Electronics") requires knowing every descendant category ID ("Phones", "Laptops", ...). Recursive lookups at read time are slow. Instead, each product stores its full ancestor chain (`categoryPath`) at write time, so filtering by any ancestor is a single indexed `$in` query — no recursion needed on every request.
 
-**Why soft delete instead of hard delete?**
+</details>
+
+<details>
+<summary>Why soft delete instead of hard delete?</summary>
+
 Hard deleting a category that has historical products would break referential integrity and orphan data. Soft delete (`isActive: false`) preserves history while hiding records from public responses. Category deletion additionally checks for active products first and blocks deletion rather than cascading — preventing accidental mass data loss.
 
-**Why explicit slug generation instead of a Mongoose pre-save hook?**
+</details>
+
+<details>
+<summary>Why explicit slug generation instead of a Mongoose pre-save hook?</summary>
+
 Mongoose's `pre('save')` hook only fires on `.save()`, not on `findByIdAndUpdate()` — which this project uses for all updates. Relying on the hook silently fails to regenerate slugs on update. Calling a shared `slugify()` utility explicitly in both `createProduct`/`createCategory` and `updateProduct`/`updateCategory` removes this hidden inconsistency.
 
-**Why Redis for the cart, not Mongo/Postgres?**
+</details>
+
+<details>
+<summary>Why Redis for the cart, not Mongo/Postgres?</summary>
+
 A cart is a shopping basket: written often, allowed to vanish, and not money. Redis hashes give O(1) add/remove of a single product without rewriting the whole document, plus TTL so abandoned carts disappear without a cron job. Orders live in PostgreSQL because money cannot vanish.
 
-**Why a Redis hash, not one JSON string?**
+</details>
+
+<details>
+<summary>Why a Redis hash, not one JSON string?</summary>
+
 A JSON blob is a read-modify-write on every change — two tabs can overwrite each other. `HINCRBY` is atomic: field missing → create at N; field exists → add N.
 
-**Why the cart does not store price?**
+</details>
+
+<details>
+<summary>Why the cart does not store price?</summary>
+
 Price is not allowed to go stale. If Redis stored `price: 999` and an admin later set `899`, checkout would charge the wrong amount. Redis holds **productId + quantity** (intent). GET re-reads Mongo for name and price (the shelf tag). Stock is checked at order time, not on add.
 
-**Why SHA-256 for OTP and access-token blacklist, bcrypt for passwords?**
+</details>
+
+<details>
+<summary>Why SHA-256 for OTP and access-token blacklist, bcrypt for passwords?</summary>
+
 Passwords are human-chosen and live for years — bcrypt is slow on purpose. OTPs are 6 random digits with a 10-minute TTL; access tokens die in 15 minutes. SHA-256 is instant and matches how refresh tokens are stored. The real OTP defenses are TTL, delete-after-use, and rate limiting — a 6-digit space is brute-forceable offline either way.
 
-**Why two rate-limit counters (IP and email), not one key `ip+email`?**
+</details>
+
+<details>
+<summary>Why two rate-limit counters (IP and email), not one key `ip+email`?</summary>
+
 A single glued key `1.2.3.4:alice@x.com` treats `1.2.3.4:bob@x.com` as a fresh bucket — one IP can attack unlimited emails. Two counters mean both must pass: this computer cannot hammer, and this inbox cannot be hammered.
 
-**Why empty cart is 200, not 404?**
+</details>
+
+<details>
+<summary>Why empty cart is 200, not 404?</summary>
+
 `GET /cart` asks “what’s in my basket?” An empty answer is success. 404 would mean the resource does not exist; 400 would mean the client sent a bad request. A new user or a cleared cart is neither.
 
-**Why GET does not refresh cart TTL?**
+</details>
+
+<details>
+<summary>Why GET does not refresh cart TTL?</summary>
+
 TTL means “7 days since they last **changed** the basket.” Opening the cart page, a leftover tab, or a polling frontend is not shopping. If GET reset the timer, abandoned carts would live forever.
 
-**Why lowercase email in the service, not in Zod?**
+</details>
+
+<details>
+<summary>Why lowercase email in the service, not in Zod?</summary>
+
 Zod is the HTTP door — it only runs on that route. `register` and `sendOtp` can also be called from each other (or later from a job) with no Zod. The service owns how email is stored. Zod only `.trim()`s and checks format.
 
-**Why connect Redis before requiring `app`?**
+</details>
+
+<details>
+<summary>Why connect Redis before requiring `app`?</summary>
+
 `express-rate-limit` + `rate-limit-redis` talk to Redis when the limiter module loads. If `app.js` is required first, Redis is still closed and store init throws `ClientClosedError`. `server.js` runs `connectRedis()` then `require('./src/app')`.
 
-**Why cache in middleware, not in `getProducts`?**
+</details>
+
+<details>
+<summary>Why cache in middleware, not in `getProducts`?</summary>
+
 `cacheMiddleware(ttl)` is the same shape as `validate(schema)`: one function, TTL as the argument, the service never hears about Redis. The list JSON is already what the client needs. Wrapping `res.json` stores that exact envelope without a second mapper.
 
-**Why the cache key includes `req.originalUrl`?**
+</details>
+
+<details>
+<summary>Why the cache key includes `req.originalUrl`?</summary>
+
 `GET /products` and `GET /products?cursor=<id>` are different lists. One key `cache:products` would let page 2 overwrite page 1. `cache:${originalUrl}` makes each query string its own entry. Prefix `cache:` so it never collides with `cart:`, `otp:`, `reset:`, `bl:`, `rl:`, `lock:`, or `bull:`.
 
-**Why fail-open if Redis is down?**
+</details>
+
+<details>
+<summary>Why fail-open if Redis is down?</summary>
+
 Cache is a speedup, not the source of truth. A `GET` error or a failed `setEx` must still return Mongo. A shop that 500s because Redis restarted is worse than a shop that is merely slower.
 
-**Why only cache `success: true`?**
+</details>
+
+<details>
+<summary>Why only cache `success: true`?</summary>
+
 After `res.json` is wrapped, the error handler also calls `res.json`. Without the `data.success` check, a 400 would be stored for 10 minutes and every next visitor would get a cached error.
 
-**Why `SCAN` instead of `KEYS` for invalidation?**
+</details>
+
+<details>
+<summary>Why `SCAN` instead of `KEYS` for invalidation?</summary>
+
 `KEYS cache:/products*` blocks Redis and walks the whole keyspace — cart, OTP, and rate limits wait too. `SCAN` walks in chunks (`COUNT: 100`). The cursor from Redis is a **string** (`"0"`), not the number `0`; comparing to `0` never ends the loop.
 
-**Why invalidate from the service after Mongo succeeds?**
+</details>
+
+<details>
+<summary>Why invalidate from the service after Mongo succeeds?</summary>
+
 If create throws, there is nothing new to expose — don't drop a warm cache. If you invalidate before the write, a GET in between refills Redis with the **old** document. Category writes also drop `cache:/products*` because the product list populates category `name` / `slug`.
 
-**Why a Redis lock on cache miss (stampede)?**
+</details>
+
+<details>
+<summary>Why a Redis lock on cache miss (stampede)?</summary>
+
 Invalidating (or a cold cache) plus 10 000 concurrent `GET /products` is 10 000 Mongo queries and 10 000 `SET`s — a cache stampede / thundering herd. `SET lock:<url> NX EX 10` lets **one** request rebuild the cache. Others poll Redis briefly, then read the new value.
 
-**Why release the lock inside `res.json`, not after `next()`?**
+</details>
+
+<details>
+<summary>Why release the lock inside `res.json`, not after `next()`?</summary>
+
 Express `next()` does not wait for the controller. `await next()` then `releaseLock` in `finally` drops the lock **before** Mongo finishes, and the waiters all miss again. The lock is released in `res.json`'s `finally` — after `setEx` (or after a failed write / error body). If `res.json` never runs, `EX 10` still frees the lock.
 
-**Why not cache-key versioning?**
+</details>
+
+<details>
+<summary>Why not cache-key versioning?</summary>
+
 Versioning puts `v5` in the key and invalidates by bumping `v` — old keys expire via TTL, no `SCAN`. Not implemented here: extra leftover keys until TTL, and `SCAN` + prefix delete is enough at this scale. Documented as a known next step, not as shipping code.
 
-**Why copy address and price onto the Order?**
+</details>
+
+<details>
+<summary>Why copy address and price onto the Order?</summary>
+
 If OrderItem only stored `productId`, a later catalog price change would rewrite history. Checkout reads live Mongo **once**, then writes name, price, qty, lineTotal. Address fields are copied the same way so editing a saved address does not mutate old bills.
 
-**Why Mongo `productId` is a string on OrderItem, not a Postgres FK?**
+</details>
+
+<details>
+<summary>Why Mongo `productId` is a string on OrderItem, not a Postgres FK?</summary>
+
 Products live in Mongo. Postgres cannot reference that `_id` as a foreign key. The line stores the id as text plus the snapshot.
 
-**Why decrement stock with `$gte` + `$inc`, not read-then-write?**
+</details>
+
+<details>
+<summary>Why decrement stock with `$gte` + `$inc`, not read-then-write?</summary>
+
 Two checkouts can both read `quantity: 1` and both sell. `findOneAndUpdate({ quantity: { $gte: qty } }, { $inc: { quantity: -qty } })` is one atomic check. `null` → not enough stock. Lines already decremented are rolled back (`restoreStock`) if a later line fails or Prisma/Razorpay throws.
 
-**Why clear the cart after the order row exists?**
+</details>
+
+<details>
+<summary>Why clear the cart after the order row exists?</summary>
+
 Clear first + create fails = basket gone and no bill. Redis is not in the Prisma transaction. Order + items + payment first, then `DEL cart:<userId>`.
 
-**Why Razorpay order inside checkout, not a second “pay” endpoint?**
+</details>
+
+<details>
+<summary>Why Razorpay order inside checkout, not a second “pay” endpoint?</summary>
+
 One round trip: local order + Razorpay `order_id` for Checkout. The browser never sends an amount to charge — only that id.
 
-**Why webhook HMAC on `req.rawBody`, not `JSON.stringify(req.body)`?**
+</details>
+
+<details>
+<summary>Why webhook HMAC on `req.rawBody`, not `JSON.stringify(req.body)`?</summary>
+
 Razorpay signs the exact bytes. Re-serializing JSON can change key order/spacing and fail the signature. `express.json({ verify })` stores the buffer as `req.rawBody`.
 
-**Why both `/payments/verify` and `/payments/webhook`?**
+</details>
+
+<details>
+<summary>Why both `/payments/verify` and `/payments/webhook`?</summary>
+
 Verify = Checkout `handler` (user still on the page). Webhook = Razorpay’s server, even if they close the tab. Both call `capturePayment`. If status is not `PENDING`, return — idempotent.
 
-**Why cancel PENDING restores stock immediately, but PAID waits for `refund.processed`?**
+</details>
+
+<details>
+<summary>Why cancel PENDING restores stock immediately, but PAID waits for `refund.processed`?</summary>
+
 PENDING never took money. PAID did — putting stock back before Razorpay confirms the refund would oversell if the refund fails.
 
-**Why `updateMany` where `status: PENDING` (or `REFUND_INITIATED`) before restore?**
+</details>
+
+<details>
+<summary>Why `updateMany` where `status: PENDING` (or `REFUND_INITIATED`) before restore?</summary>
+
 Two cancel/webhook deliveries can both pass an `if (status === …)` check. `updateMany` + `count === 0` claims the row once. `finishRefund` no-ops if the order is already `CANCELLED` (crash recovery if payment is `REFUNDED` but the order never flipped).
 
-**Why a partial unique index on default address?**
+</details>
+
+<details>
+<summary>Why a partial unique index on default address?</summary>
+
 Two first-address requests can both see “no default” and both insert `isDefault: true`. App logic is not enough. Postgres: `UNIQUE ("userId") WHERE "isDefault" = true`. A second `true` is `P2002`. Many `false` rows are allowed. Prisma 6 cannot express that `where` in schema — the index lives in a raw SQL migration.
 
-**Why send order confirmation and reset mail as jobs, not `await sendMail` in the request?**
+</details>
+
+<details>
+<summary>Why send order confirmation and reset mail as jobs, not `await sendMail` in the request?</summary>
+
 Gmail is slow and can 535. If checkout waited on mail, the user would stare at a spinner after they already paid. If a throw after `PAID` rolled the order back, the shop would look unpaid while Razorpay already took the money. The API `add`s a job and returns. The worker sends. OTP is still on the request because it was built before the queue existed.
 
-**Why keep `PAID` if the email job fails?**
+</details>
+
+<details>
+<summary>Why keep `PAID` if the email job fails?</summary>
+
 Order status is payment truth. Bull retries 3 times with exponential backoff; then `queue.on('failed')` logs job id, name, orderId/email, error. Support can resend. There is no `emailSent` column this week — Bull’s failed list is enough.
 
-**Why enqueue confirmation only inside `capturePayment` after the flip?**
+</details>
+
+<details>
+<summary>Why enqueue confirmation only inside `capturePayment` after the flip?</summary>
+
 `verify` and `webhook` both call `capturePayment`. The second call is a no-op on the DB. Enqueue on every call would send two mails. `add` runs only when status was `PENDING`. A Redis hiccup on `add` is try/caught so the webhook still 200s.
 
-**Why a second process (`npm run worker`) instead of `emailQueue.process` in `server.js`?**
-A thrown error inside a Bull processor is caught by Bull (retry / failed). What isolation actually buys: uncaught exceptions, OOM, unhandled queue `error` events, and Prisma-pool storms kill **that** Node process. If processors live in the API, `/products` dies with them. Two processes: the shop keeps taking checkout; jobs wait in Redis until the worker restarts. Scale HTTP and mail independently.
+</details>
 
-**Why Bull + ioredis next to the existing `redis` package?**
+<details>
+<summary>Why a second process (`npm run worker`) *and* `RUN_WORKER_IN_PROCESS`?</summary>
+
+Isolation still matters: a worker crash should not kill `/products`. Render **free** only gives one always-on-when-awake process, so `server.js` calls `startEmailWorker()` when `RUN_WORKER_IN_PROCESS=true`. Set `false` on the API and run `npm run worker` (or a paid Background Worker) for two processes. Do not run both at once (two consumers; Bull locks jobs so mail is still once, but it is wasteful). `queue.js` still has no `.process()` of its own.
+
+</details>
+
+<details>
+<summary>Why one `REDIS_URL`, not `REDIS_HOST` + `REDIS_PORT`?</summary>
+
+Cart already used a URL. Bull used host/port with no password or TLS. Upstash needs `rediss://default:PASSWORD@host:6379`. One URL feeds node-redis and Bull.
+
+</details>
+
+<details>
+<summary>Why `trust proxy`?</summary>
+
+Render terminates HTTPS in front of Node. Without `app.set('trust proxy', 1)`, rate limits see the proxy as every user’s IP, and `secure` cookies may not see HTTPS.
+
+</details>
+
+<details>
+<summary>Why `/health` and `/ready`?</summary>
+
+`/health` is process-only so Render’s platform check cannot fail because Neon is cold. `/ready` pings Mongo, Redis, and `SELECT 1` on Postgres. UptimeRobot hits `/ready` every 5 minutes so the free web service (and the stores) stay awake.
+
+</details>
+
+<details>
+<summary>Why Bull + ioredis next to the existing `redis` package?</summary>
+
 Cart, OTP, cache, and rate limits already use node-redis. Bull talks Redis through **ioredis**. Two clients to the same `127.0.0.1:6379` is normal. `queue.js` only constructs the Queue — **no** `.process()` — so requiring it from the API cannot start consumers.
 
-**Why one `email` queue and two job names?**
+</details>
+
+<details>
+<summary>Why one `email` queue and two job names?</summary>
+
 Both jobs are “send mail.” One worker, one failed list, one retry policy. A second queue is for different concurrency or pausing one kind of mail — not needed yet.
 
-**Why Redis for the reset token, keyed by token hash?**
+</details>
+
+<details>
+<summary>Why Redis for the reset token, keyed by token hash?</summary>
+
 Same shape as OTP: short-lived, one-shot. A `User` column would be a migration for a 15-minute secret. Key `reset:<sha256(token)>` → email so the **link only needs `?token=`** (email in the URL is PII in history/Referer). Lookup hashes the query token and `GET`s that key.
 
-**Why always 200 on forgot-password?**
+</details>
+
+<details>
+<summary>Why always 200 on forgot-password?</summary>
+
 `404 email not registered` lets attackers probe accounts. Unknown email returns; the controller still 200s. Same idea as `sendOtp`.
 
-**Why `BASE_URL` and not `PASSWORD_RESET_URL`?**
+</details>
+
+<details>
+<summary>Why `BASE_URL` and not `PASSWORD_RESET_URL`?</summary>
+
 The env is the **origin**. The path `/auth/reset-password` lives in code. Same origin later for other links. No trailing slash (`http://localhost:3000/` + `/auth/...` would double-slash). Production frontend later changes the path string to `/reset-password`; the env stays the origin.
 
-**Why reset Zod in the controller, not `validate()` on the route?**
+</details>
+
+<details>
+<summary>Why reset Zod in the controller, not `validate()` on the route?</summary>
+
 `validate()` only `safeParse(req.body)`. The token is on `req.query` when the mail link is pasted into Postman. Merging `req.body.token || req.query.token` then `resetPasswordSchema.safeParse` is the one-off. Forgot still uses route `validate`.
 
-**Why Helmet + a CORS whitelist?**
+</details>
+
+<details>
+<summary>Why Helmet + a CORS whitelist?</summary>
+
 Helmet adds clickjacking / MIME-sniff / `X-Powered-By` headers. Browser JS may only call this API from origins in `CORS_ORIGINS`. Refresh is a cookie, so `credentials: true` and origin cannot be `*`. No `Origin` (Postman, Razorpay webhook, curl) is allowed. Unknown origin → `cb(null, false)` (browser blocks; API does not 500).
 
-**Why cursor pagination instead of `page` + `skip`?**
+</details>
+
+<details>
+<summary>Why cursor pagination instead of `page` + `skip`?</summary>
+
 `skip(10000)` still walks 10 000 docs. Inserts during a crawl duplicate or skip rows. `countDocuments` on every list is expensive. Cursor: `find({ _id: { $lt: cursor } }).sort({ _id: -1 }).limit(n)`. Fetch `limit+1` to set `hasMore`; return `n` items and `nextCursor` = last returned `_id`. No total / totalPages — infinite scroll does not need “page 3 of 40.”
 
-**Why Morgan into Winston, not two consoles?**
-Morgan is the access line. Winston is levels + files. Piping Morgan’s `write` into `logger.http` means one logger owns the terminal and `logs/combined.log`. `errorHandler` logs **before** the development `return` so 400s appear in `logs/error.log` locally too. `req.body` is never logged (passwords, tokens, signatures). `/health` is skipped.
+</details>
+
+<details>
+<summary>Why Morgan into Winston, not two consoles?</summary>
+
+Morgan is the access line. Winston is levels + files. Piping Morgan’s `write` into `logger.http` means one logger owns the terminal and `logs/combined.log`. `errorHandler` logs **before** the development `return` so 400s appear in `logs/error.log` locally too. `req.body` is never logged (passwords, tokens, signatures). `/health` and `/ready` are skipped.
+
+</details>
 
 ---
 
@@ -326,9 +557,10 @@ ecommerce-backend/
 │
 ├── src/
 │   ├── config/
+│   │   ├── env.js                 # Required env names; process.exit if missing
 │   │   ├── prisma.js              # Prisma singleton — one connection pool
 │   │   ├── mongoose.js            # MongoDB connection
-│   │   ├── redis.js               # Redis client + connectRedis() (cart / OTP / cache)
+│   │   ├── redis.js               # Redis client + connectRedis() (cart / OTP / cache / Bull URL)
 │   │   ├── mailer.js              # Nodemailer Gmail transporter
 │   │   ├── razorpay.js            # Razorpay SDK instance
 │   │   ├── cloudinary.js          # Cloudinary SDK configuration
@@ -384,9 +616,13 @@ ecommerce-backend/
 │   │   └── category.validator.js  # create / update — name, description, parent only
 │   │
 │   ├── jobs/
-│   │   ├── queue.js               # Bull `email` queue (API and worker both require this)
+│   │   ├── queue.js               # Bull `email` queue (REDIS_URL)
 │   │   ├── email.processor.js     # order-confirmation + password-reset handlers
-│   │   └── worker.js              # process entry — npm run worker (no Express)
+│   │   └── worker.js              # startEmailWorker(); npm run worker when require.main
+│   │
+│   ├── docs/
+│   │   ├── swagger.js             # OpenAPI 3 spec
+│   │   └── paths.yaml             # All implemented HTTP operations
 │   │
 │   ├── utils/
 │   │   ├── AppError.js            # Custom error class with status codes
@@ -399,10 +635,14 @@ ecommerce-backend/
 │   ├── scripts/
 │   │   └── seedProducts.js        # Faker.js seed — realistic demo products
 │   │
-│   └── app.js                     # Helmet, CORS, Morgan, JSON rawBody, routes
+│   └── app.js                     # Helmet, CORS, trust proxy, Morgan, Swagger, routes
 │
+├── public/                        # Landing `/`, favicon.svg, styles, theme
+├── docs/postman/                  # ecommerce.postman_collection.json
 ├── logs/                          # Winston files (gitignored via *.log)
-├── server.js                      # HTTP process — npm run dev
+├── server.js                      # HTTP process — npm run dev / npm start
+├── Dockerfile
+├── docker-compose.yml             # postgres, mongo, redis, api (worker in-process)
 ├── .env.example                   # All required environment variables
 └── README.md
 ```
@@ -414,7 +654,10 @@ ecommerce-backend/
 ### Base URL
 ```
 http://localhost:3000
+https://e-commerce-backend-iea3.onrender.com
 ```
+
+Public, no auth: `GET /` (landing), `GET /health`, `GET /ready`, `GET /api-docs`.
 
 ### Standard Response Format
 
@@ -529,9 +772,51 @@ Authorization: Bearer <access_token>
 
 ## 📖 API Reference
 
-> **Format note:** Each endpoint lists its middleware chain in execution order, the exact internal flow inside the service layer, and every error case the route can return. This mirrors how the codebase actually executes a request, not just the happy path.
+> **Format note:** Each endpoint lists its middleware chain in execution order, the exact internal flow inside the service layer, and every error case the route can return. This mirrors how the codebase actually executes a request, not just the happy path. Interactive docs: [`/api-docs`](https://e-commerce-backend-iea3.onrender.com/api-docs).
 
-### Auth Module
+> Open a **module**, then an **endpoint**. Full internals stay in the README.
+
+<a id="health"></a>
+<details>
+<summary>Health</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
+
+<details>
+<summary>health</summary>
+
+#### GET `/health`
+
+Process is up. No database calls. Render’s health check uses this.
+
+**Success (200):** `{ "status": "ok", "message": "Server is running" }`
+
+</details>
+
+<details>
+<summary>ready</summary>
+
+#### GET `/ready`
+
+Pings Mongo (`ping: 1`), Redis (`PING`), Postgres (`SELECT 1`). Point UptimeRobot here.
+
+**Success (200):** `{ "status": "ok" }`  
+If a store throws, the global `errorHandler` returns 500.
+
+</details>
+
+</div>
+</details>
+
+
+<a id="auth-module"></a>
+<details>
+<summary>Auth Module</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
+
+<details>
+<summary>register</summary>
 
 #### POST `/auth/register`
 
@@ -591,6 +876,11 @@ Authorization: Bearer <access_token>
 
 ---
 
+</details>
+
+<details>
+<summary>login</summary>
+
 #### POST `/auth/login`
 
 **Purpose:** Authenticate a user and issue access + refresh tokens.
@@ -641,6 +931,11 @@ Authorization: Bearer <access_token>
 
 ---
 
+</details>
+
+<details>
+<summary>me</summary>
+
 #### GET `/auth/me`
 
 **Purpose:** Return the authenticated user's current profile.
@@ -681,6 +976,11 @@ Authorization: Bearer <access_token>
 3. Service re-fetches the user **fresh from PostgreSQL** with `prisma.user.findUnique()` and an explicit `select` — guarantees the response always reflects the current name/role/verification status, not a snapshot from token-issue time
 
 ---
+
+</details>
+
+<details>
+<summary>refresh token</summary>
 
 #### POST `/auth/refresh-token`
 
@@ -723,6 +1023,11 @@ Authorization: Bearer <access_token>
 
 ---
 
+</details>
+
+<details>
+<summary>logout</summary>
+
 #### POST `/auth/logout`
 
 **Purpose:** Revoke the current refresh token and clear the cookie.
@@ -754,6 +1059,11 @@ Authorization: Bearer <access_token>
 6. The same Bearer token now fails `protect` with `401 Token revoked` until it would have expired anyway
 
 ---
+
+</details>
+
+<details>
+<summary>send OTP</summary>
 
 #### POST `/auth/send-otp`
 
@@ -795,6 +1105,11 @@ Authorization: Bearer <access_token>
 6. Nodemailer sends the **raw** 6 digits to that inbox. If `sendMail` throws, the error is not swallowed on this route (register is the one that catches it)
 
 ---
+
+</details>
+
+<details>
+<summary>verify OTP</summary>
 
 #### POST `/auth/verify-otp`
 
@@ -846,6 +1161,11 @@ Authorization: Bearer <access_token>
 
 ---
 
+</details>
+
+<details>
+<summary>forgot password</summary>
+
 #### POST `/auth/forgot-password`
 
 **Purpose:** If that email is a user, store a reset token and **enqueue** a mail with a link. Always 200.
@@ -888,6 +1208,11 @@ OTP mail stays `await sendMail` on the request. Only reset and order confirmatio
 
 ---
 
+</details>
+
+<details>
+<summary>reset password</summary>
+
 #### POST `/auth/reset-password`
 
 **Purpose:** Set a new password from the token on the link. All refresh sessions die.
@@ -924,7 +1249,20 @@ Gmail’s click is a **GET**. This route is POST, so the browser will not reset 
 
 ---
 
-### Cart Module
+</details>
+
+</div>
+</details>
+
+
+<a id="cart-module"></a>
+<details>
+<summary>Cart Module</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
+
+<details>
+<summary>add</summary>
 
 #### POST `/cart/add`
 
@@ -978,6 +1316,11 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 
 ---
 
+</details>
+
+<details>
+<summary>list</summary>
+
 #### GET `/cart`
 
 **Purpose:** Return the cart with live names, prices, line totals, and a grand total.
@@ -1017,6 +1360,11 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 
 ---
 
+</details>
+
+<details>
+<summary>remove item</summary>
+
 #### DELETE `/cart/items/:id`
 
 **Purpose:** Remove that product line entirely (trash-can), regardless of quantity. Decrease-qty (`−` button) is a different future endpoint.
@@ -1040,6 +1388,11 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 4. Returns `getCart(userId)`. After deleting the last item the key is gone; `HGETALL` on a missing key returns `{}` and getCart already treats that as an empty cart
 
 ---
+
+</details>
+
+<details>
+<summary>clear</summary>
 
 #### DELETE `/cart`
 
@@ -1065,13 +1418,26 @@ Stock is **not** checked here. Cart is intent; inventory is deducted at checkout
 
 ---
 
-### Address Module
+</details>
+
+</div>
+</details>
+
+
+<a id="address-module"></a>
+<details>
+<summary>Address Module</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
 
 All address routes require `protect`. `userId` comes from the JWT, **never** from the body. `PATCH /:id/default` is registered **before** `PUT /:id` so Express does not treat `"default"` as an `:id`.
 
 Postgres enforces **at most one default per user** with a partial unique index (`WHERE "isDefault" = true`). Prisma 6 cannot declare that `where` in `schema.prisma` — the index is a raw SQL migration. Concurrent first-address creates: one `201`, the other `P2002` → `409`.
 
 ---
+
+<details>
+<summary>create</summary>
 
 #### POST `/addresses`
 
@@ -1133,6 +1499,11 @@ Postgres enforces **at most one default per user** with a partial unique index (
 
 ---
 
+</details>
+
+<details>
+<summary>list</summary>
+
 #### GET `/addresses`
 
 **Purpose:** List **this** user's addresses. Default first.
@@ -1148,6 +1519,11 @@ Postgres enforces **at most one default per user** with a partial unique index (
 **Internal Flow:** `findMany({ where: { userId }, orderBy: [{ isDefault: 'desc' }, { createdAt: 'desc' }] })`.
 
 ---
+
+</details>
+
+<details>
+<summary>update</summary>
 
 #### PUT `/addresses/:id`
 
@@ -1173,6 +1549,11 @@ Postgres enforces **at most one default per user** with a partial unique index (
 
 ---
 
+</details>
+
+<details>
+<summary>set default</summary>
+
 #### PATCH `/addresses/:id/default`
 
 **Purpose:** Make this address the only default. No body.
@@ -1186,6 +1567,11 @@ Postgres enforces **at most one default per user** with a partial unique index (
 **Internal Flow:** Ownership check → if already default, return it → else unset all defaults for the user, set this one `true`, in a transaction.
 
 ---
+
+</details>
+
+<details>
+<summary>delete</summary>
 
 #### DELETE `/addresses/:id`
 
@@ -1207,7 +1593,20 @@ Postgres enforces **at most one default per user** with a partial unique index (
 
 ---
 
-### Product Module
+</details>
+
+</div>
+</details>
+
+
+<a id="product-module"></a>
+<details>
+<summary>Product Module</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
+
+<details>
+<summary>create</summary>
 
 #### POST `/products`
 
@@ -1271,6 +1670,11 @@ Postgres enforces **at most one default per user** with a partial unique index (
 
 ---
 
+</details>
+
+<details>
+<summary>list</summary>
+
 #### GET `/products`
 
 **Purpose:** List products with category, search, attribute, and price filtering, plus **cursor** pagination.
@@ -1327,6 +1731,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>filters</summary>
+
 #### GET `/products/filters`
 
 **Purpose:** Return every unique attribute key and its possible values for a given category, so the frontend can render filter checkboxes without hardcoding anything.
@@ -1376,6 +1785,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>get by slug</summary>
+
 #### GET `/products/:slug`
 
 **Purpose:** Fetch a single product by its slug.
@@ -1405,6 +1819,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>update</summary>
+
 #### PUT `/products/:id`
 
 **Purpose:** Update a product by its MongoDB `_id` (Admin only).
@@ -1430,6 +1849,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>delete</summary>
+
 #### DELETE `/products/:id`
 
 **Purpose:** Soft-delete a product (Admin only).
@@ -1450,6 +1874,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 2. Every public read query (`getProducts`, `getProductBySlug`, `getProductFilters`) filters on `isActive: true`, so the product disappears from the catalog without losing historical data (e.g. for past orders that reference it)
 
 ---
+
+</details>
+
+<details>
+<summary>upload image</summary>
 
 #### POST `/products/:id/images`
 
@@ -1480,7 +1909,20 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
-### Category Module
+</details>
+
+</div>
+</details>
+
+
+<a id="category-module"></a>
+<details>
+<summary>Category Module</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
+
+<details>
+<summary>create</summary>
 
 #### POST `/categories`
 
@@ -1510,6 +1952,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>list</summary>
+
 #### GET `/categories`
 
 **Purpose:** List categories, optionally filtered by parent.
@@ -1536,6 +1983,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>get by slug</summary>
+
 #### GET `/categories/:slug`
 
 **Purpose:** Fetch a single category by slug, with its parent populated.
@@ -1548,6 +2000,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>update</summary>
+
 #### PUT `/categories/:id`
 
 **Purpose:** Update a category (Admin only). Same slug-regeneration logic as product updates — `slugify()` is called explicitly when `name` changes.
@@ -1559,6 +2016,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 `updateCategorySchema` is the same three fields, all optional. Extra keys stripped before `findByIdAndUpdate`.
 
 ---
+
+</details>
+
+<details>
+<summary>delete</summary>
 
 #### DELETE `/categories/:id`
 
@@ -1578,6 +2040,11 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
+</details>
+
+<details>
+<summary>upload image</summary>
+
 #### POST `/categories/:id/image`
 
 **Purpose:** Upload/replace a category's image.
@@ -1586,7 +2053,20 @@ Last page: `nextCursor: null`, `hasMore: false`.
 
 ---
 
-### Orders Module
+</details>
+
+</div>
+</details>
+
+
+<a id="orders-module"></a>
+<details>
+<summary>Orders Module</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
+
+<details>
+<summary>checkout</summary>
 
 #### POST `/orders/checkout`
 
@@ -1666,6 +2146,11 @@ Checkout does **not** trust a client-sent total. Razorpay Checkout is opened wit
 
 ---
 
+</details>
+
+<details>
+<summary>list</summary>
+
 #### GET `/orders`
 
 **Purpose:** List the logged-in user's orders, newest first.
@@ -1681,6 +2166,11 @@ Checkout does **not** trust a client-sent total. Razorpay Checkout is opened wit
 **Internal Flow:** `findMany({ where: { userId }, include: { items: true, payment: true }, orderBy: { createdAt: 'desc' } })`. Registered as `GET /` **before** `GET /:id`.
 
 ---
+
+</details>
+
+<details>
+<summary>get by id</summary>
 
 #### GET `/orders/:id`
 
@@ -1706,6 +2196,11 @@ Checkout does **not** trust a client-sent total. Razorpay Checkout is opened wit
 4. Compare `order.userId` to **`userId`**, not to `orderId` (that bug 403s even on your own order)
 
 ---
+
+</details>
+
+<details>
+<summary>cancel</summary>
 
 #### POST `/orders/:id/cancel`
 
@@ -1747,7 +2242,17 @@ PAID path: `{ "success": true, "message": "Refund initiated, this may take a few
 
 ---
 
-### Payments Module
+</details>
+
+</div>
+</details>
+
+
+<a id="payments-module"></a>
+<details>
+<summary>Payments Module</summary>
+
+<div style="margin-left: 1.75rem; padding-left: 0.75rem; border-left: 2px solid #d0d7de;">
 
 Razorpay **test** keys live in `.env`. The browser only ever sees `KEY_ID` + `order_id`. Webhooks cannot hit `localhost` — use `npx ngrok http 3000` and set the dashboard URL to `https://<host>/payments/webhook`. Events: `payment.captured`, `refund.processed`.
 
@@ -1762,6 +2267,9 @@ app.use(express.json({
 ```
 
 ---
+
+<details>
+<summary>verify</summary>
 
 #### POST `/payments/verify`
 
@@ -1797,6 +2305,11 @@ app.use(express.json({
 2. `capturePayment(orderId, paymentId)`
 
 ---
+
+</details>
+
+<details>
+<summary>webhook</summary>
 
 #### POST `/payments/webhook`
 
@@ -1840,11 +2353,21 @@ app.use(express.json({
 
 ---
 
+</details>
+
+</div>
+</details>
+
+
 ## 🧩 Function & Middleware Reference
 
 > Only functions with non-trivial internal logic are documented here. Simple pass-through controllers are omitted.
 
-### `slugify(text)`
+<a id="slugify-text"></a>
+<details>
+<summary>slugify</summary>
+
+`slugify(text)`
 
 | Detail | Value |
 |---|---|
@@ -1867,7 +2390,13 @@ app.use(express.json({
 
 ---
 
-### `buildCategoryChain(categoryId)` *(internal helper, not exported)*
+</details>
+
+<a id="buildcategorychain-categoryid-internal-helper-not-exported"></a>
+<details>
+<summary>buildCategoryChain</summary>
+
+`buildCategoryChain(categoryId)` *(internal helper, not exported)*
 
 | Detail | Value |
 |---|---|
@@ -1890,7 +2419,13 @@ app.use(express.json({
 
 ---
 
-### `auth.service.register(name, email, password)`
+</details>
+
+<a id="auth-service-register-name-email-password"></a>
+<details>
+<summary>register</summary>
+
+`auth.service.register(name, email, password)`
 
 | Detail | Value |
 |---|---|
@@ -1907,7 +2442,13 @@ app.use(express.json({
 
 ---
 
-### `auth.service.login(email, password)`
+</details>
+
+<a id="auth-service-login-email-password"></a>
+<details>
+<summary>login</summary>
+
+`auth.service.login(email, password)`
 
 | Detail | Value |
 |---|---|
@@ -1923,7 +2464,13 @@ app.use(express.json({
 
 ---
 
-### `auth.service.refreshAccessToken(rawToken)`
+</details>
+
+<a id="auth-service-refreshaccesstoken-rawtoken"></a>
+<details>
+<summary>refreshAccessToken</summary>
+
+`auth.service.refreshAccessToken(rawToken)`
 
 | Detail | Value |
 |---|---|
@@ -1940,7 +2487,13 @@ app.use(express.json({
 
 ---
 
-### `auth.service.logout(rawToken, accessToken)`
+</details>
+
+<a id="auth-service-logout-rawtoken-accesstoken"></a>
+<details>
+<summary>logout</summary>
+
+`auth.service.logout(rawToken, accessToken)`
 
 | Detail | Value |
 |---|---|
@@ -1956,7 +2509,13 @@ app.use(express.json({
 
 ---
 
-### `auth.service.sendOtp(email)`
+</details>
+
+<a id="auth-service-sendotp-email"></a>
+<details>
+<summary>sendOtp</summary>
+
+`auth.service.sendOtp(email)`
 
 | Detail | Value |
 |---|---|
@@ -1971,7 +2530,13 @@ app.use(express.json({
 
 ---
 
-### `auth.service.verifyOtp(email, otp)`
+</details>
+
+<a id="auth-service-verifyotp-email-otp"></a>
+<details>
+<summary>verifyOtp</summary>
+
+`auth.service.verifyOtp(email, otp)`
 
 | Detail | Value |
 |---|---|
@@ -1985,7 +2550,13 @@ app.use(express.json({
 
 ---
 
-### `auth.service.forgotPassword(email)` / `resetPassword(token, password)`
+</details>
+
+<a id="auth-service-forgotpassword-email-resetpassword-token-password"></a>
+<details>
+<summary>forgotPassword / resetPassword</summary>
+
+`auth.service.forgotPassword(email)` / `resetPassword(token, password)`
 
 | Detail | Value |
 |---|---|
@@ -2002,7 +2573,13 @@ app.use(express.json({
 
 ---
 
-### `cart.service.addToCart(userId, productId, quantity)`
+</details>
+
+<a id="cart-service-addtocart-userid-productid-quantity"></a>
+<details>
+<summary>addToCart</summary>
+
+`cart.service.addToCart(userId, productId, quantity)`
 
 | Detail | Value |
 |---|---|
@@ -2017,7 +2594,13 @@ app.use(express.json({
 
 ---
 
-### `cart.service.getCart(userId)`
+</details>
+
+<a id="cart-service-getcart-userid"></a>
+<details>
+<summary>getCart</summary>
+
+`cart.service.getCart(userId)`
 
 | Detail | Value |
 |---|---|
@@ -2032,7 +2615,13 @@ app.use(express.json({
 
 ---
 
-### `cart.service.removeItem(userId, productId)` / `clearCart(userId)`
+</details>
+
+<a id="cart-service-removeitem-userid-productid-clearcart-userid"></a>
+<details>
+<summary>removeItem / clearCart</summary>
+
+`cart.service.removeItem(userId, productId)` / `clearCart(userId)`
 
 **removeItem:** `HDEL` → 0 means 404. Empty hash → `DEL` the key (must use `Object.keys(fields).length`, not `if (fields)`). Remaining items → refresh TTL. Then `getCart`.
 
@@ -2040,7 +2629,13 @@ app.use(express.json({
 
 ---
 
-### `product.service.getProducts(filters)`
+</details>
+
+<a id="product-service-getproducts-filters"></a>
+<details>
+<summary>getProducts</summary>
+
+`product.service.getProducts(filters)`
 
 | Detail | Value |
 |---|---|
@@ -2057,7 +2652,13 @@ app.use(express.json({
 
 ---
 
-### `product.service.getProductFilters(filters)`
+</details>
+
+<a id="product-service-getproductfilters-filters"></a>
+<details>
+<summary>getProductFilters</summary>
+
+`product.service.getProductFilters(filters)`
 
 | Detail | Value |
 |---|---|
@@ -2076,7 +2677,13 @@ app.use(express.json({
 
 ---
 
-### `protect` — `src/middlewares/auth.middleware.js`
+</details>
+
+<a id="protect-src-middlewares-auth-middleware-js"></a>
+<details>
+<summary>protect</summary>
+
+`protect` — `src/middlewares/auth.middleware.js`
 
 | Detail | Value |
 |---|---|
@@ -2092,7 +2699,13 @@ app.use(express.json({
 
 ---
 
-### `authorize(...roles)` — `src/middlewares/authorize.js`
+</details>
+
+<a id="authorize-roles-src-middlewares-authorize-js"></a>
+<details>
+<summary>authorize</summary>
+
+`authorize(...roles)` — `src/middlewares/authorize.js`
 
 | Detail | Value |
 |---|---|
@@ -2108,7 +2721,13 @@ app.use(express.json({
 
 ---
 
-### `validate(schema)` — `src/middlewares/validate.js`
+</details>
+
+<a id="validate-schema-src-middlewares-validate-js"></a>
+<details>
+<summary>validate</summary>
+
+`validate(schema)` — `src/middlewares/validate.js`
 
 | Detail | Value |
 |---|---|
@@ -2122,7 +2741,13 @@ app.use(express.json({
 
 ---
 
-### `asyncHandler(fn)` — `src/utils/asyncHandler.js`
+</details>
+
+<a id="asynchandler-fn-src-utils-asynchandler-js"></a>
+<details>
+<summary>asyncHandler</summary>
+
+`asyncHandler(fn)` — `src/utils/asyncHandler.js`
 
 | Detail | Value |
 |---|---|
@@ -2140,7 +2765,13 @@ const asyncHandler = (fn) => (req, res, next) => {
 
 ---
 
-### `errorHandler(err, req, res, next)` — `src/middlewares/errorHandler.js`
+</details>
+
+<a id="errorhandler-err-req-res-next-src-middlewares-errorhandler-js"></a>
+<details>
+<summary>errorHandler</summary>
+
+`errorHandler(err, req, res, next)` — `src/middlewares/errorHandler.js`
 
 | Detail | Value |
 |---|---|
@@ -2155,7 +2786,13 @@ const asyncHandler = (fn) => (req, res, next) => {
 
 ---
 
-### `AppError` — `src/utils/AppError.js`
+</details>
+
+<a id="apperror-src-utils-apperror-js"></a>
+<details>
+<summary>AppError</summary>
+
+`AppError` — `src/utils/AppError.js`
 
 | Detail | Value |
 |---|---|
@@ -2176,7 +2813,13 @@ class AppError extends Error {
 
 ---
 
-### `tokenUtils.js` — `generateAccessToken` / `generateRefreshToken`
+</details>
+
+<a id="tokenutils-js-generateaccesstoken-generaterefreshtoken"></a>
+<details>
+<summary>tokenUtils</summary>
+
+`tokenUtils.js` — `generateAccessToken` / `generateRefreshToken`
 
 | Detail | Value |
 |---|---|
@@ -2196,7 +2839,13 @@ const generateRefreshToken = (userId) =>
 
 ---
 
-### `seedProducts.js` — `src/scripts/seedProducts.js`
+</details>
+
+<a id="seedproducts-js-src-scripts-seedproducts-js"></a>
+<details>
+<summary>seedProducts</summary>
+
+`seedProducts.js` — `src/scripts/seedProducts.js`
 
 | Detail | Value |
 |---|---|
@@ -2214,7 +2863,13 @@ const generateRefreshToken = (userId) =>
 
 ---
 
-### `cacheMiddleware(ttl)` — `src/middlewares/cache.js`
+</details>
+
+<a id="cachemiddleware-ttl-src-middlewares-cache-js"></a>
+<details>
+<summary>cacheMiddleware</summary>
+
+`cacheMiddleware(ttl)` — `src/middlewares/cache.js`
 
 | Detail | Value |
 |---|---|
@@ -2231,7 +2886,13 @@ const generateRefreshToken = (userId) =>
 
 ---
 
-### `acquireLock` / `releaseLock` / `invalidateCache` — `src/utils/cache.js`
+</details>
+
+<a id="acquirelock-releaselock-invalidatecache-src-utils-cache-js"></a>
+<details>
+<summary>cache locks</summary>
+
+`acquireLock` / `releaseLock` / `invalidateCache` — `src/utils/cache.js`
 
 **acquireLock:** `SET key token NX EX ttl`. Returns the token or `null`. `NX` is what makes the lock exclusive.
 
@@ -2241,7 +2902,13 @@ const generateRefreshToken = (userId) =>
 
 ---
 
-### `order.service.checkout(userId, addressId)`
+</details>
+
+<a id="order-service-checkout-userid-addressid"></a>
+<details>
+<summary>checkout</summary>
+
+`order.service.checkout(userId, addressId)`
 
 | Detail | Value |
 |---|---|
@@ -2260,7 +2927,13 @@ const generateRefreshToken = (userId) =>
 
 ---
 
-### `order.service.getOrder(userId, orderId)` / `getOrders(userId)`
+</details>
+
+<a id="order-service-getorder-userid-orderid-getorders-userid"></a>
+<details>
+<summary>getOrder / getOrders</summary>
+
+`order.service.getOrder(userId, orderId)` / `getOrders(userId)`
 
 **getOrders:** `findMany` where `userId`, include items + payment, `createdAt desc`. Empty list is a valid 200.
 
@@ -2268,7 +2941,13 @@ const generateRefreshToken = (userId) =>
 
 ---
 
-### `order.service.cancelOrder(userId, orderId)`
+</details>
+
+<a id="order-service-cancelorder-userid-orderid"></a>
+<details>
+<summary>cancelOrder</summary>
+
+`order.service.cancelOrder(userId, orderId)`
 
 **Internal Logic:**
 1. Load with items + payment; 404 / 403
@@ -2278,13 +2957,25 @@ const generateRefreshToken = (userId) =>
 
 ---
 
-### `restoreStock(items)` — `src/utils/stock.js`
+</details>
+
+<a id="restorestock-items-src-utils-stock-js"></a>
+<details>
+<summary>restoreStock</summary>
+
+`restoreStock(items)` — `src/utils/stock.js`
 
 For each `{ productId, quantity }`, `findByIdAndUpdate` `$inc: { quantity: +n }`. Shared by checkout `catch`, PENDING cancel, and `finishRefund`. Kept out of `order.service` / `payment.service` so those two files never `require` each other (cycle).
 
 ---
 
-### `payment.service.capturePayment(razorpayOrderId, razorpayPaymentId)`
+</details>
+
+<a id="payment-service-capturepayment-razorpayorderid-razorpaypaymentid"></a>
+<details>
+<summary>capturePayment</summary>
+
+`payment.service.capturePayment(razorpayOrderId, razorpayPaymentId)`
 
 | Detail | Value |
 |---|---|
@@ -2300,7 +2991,13 @@ Called from **both** `verifyPayment` (Checkout HMAC) and `handleWebhook` (`payme
 
 ---
 
-### `payment.service.verifyPayment(body)` / `handleWebhook(rawBody, signature, payload)`
+</details>
+
+<a id="payment-service-verifypayment-body-handlewebhook-rawbody-signature-payload"></a>
+<details>
+<summary>verifyPayment / handleWebhook</summary>
+
+`payment.service.verifyPayment(body)` / `handleWebhook(rawBody, signature, payload)`
 
 **verifyPayment:** HMAC of `orderId|paymentId` with `RAZORPAY_KEY_SECRET`, then `capturePayment`.
 
@@ -2312,7 +3009,13 @@ Called from **both** `verifyPayment` (Checkout HMAC) and `handleWebhook` (`payme
 
 ---
 
-### `src/jobs/queue.js` / `email.processor.js` / `worker.js`
+</details>
+
+<a id="src-jobs-queue-js-email-processor-js-worker-js"></a>
+<details>
+<summary>email jobs</summary>
+
+`src/jobs/queue.js` / `email.processor.js` / `worker.js`
 
 | File | Role |
 |---|---|
@@ -2323,6 +3026,8 @@ Called from **both** `verifyPayment` (Checkout HMAC) and `handleWebhook` (`payme
 Job payloads: `{ orderId }` and `{ email, token }`. Failed handler logs id, name, orderId, email, error — **never** the raw token.
 
 ---
+
+</details>
 
 ## ⏱ Rate Limiting
 
@@ -2384,14 +3089,14 @@ Homepage / top-rated lists were **not** added — there is no `rating` field. `G
 
 ## 📬 Background Jobs
 
-Two Node processes, one Redis:
+One Redis. Consumers run **in the API** when `RUN_WORKER_IN_PROCESS=true` (default for local, Compose, Render free):
 
-| Process | Command | Role |
+| Mode | Commands | Role |
 |---|---|---|
-| API | `npm run dev` / `npm start` | HTTP; `emailQueue.add(...)` only |
-| Worker | `npm run worker` | `emailQueue.process(...)`; Nodemailer |
+| In-process | `npm run dev` or `npm start` | HTTP + `emailQueue.process(...)` |
+| Separate | API: `RUN_WORKER_IN_PROCESS=false` + `npm start`; mail: `npm run worker` | Two Node processes |
 
-If the worker is down, jobs sit in Redis (`bull:email:*`). They are not lost. Mail is late; orders stay `PAID`; forgot still 200s. This is **event-driven** (user clicked), not cron (clock). Both stay up 24/7 in production (e.g. two PM2 apps).
+If no consumer is running, jobs sit in Redis (`bull:email:*`). They are not lost. Mail is late; orders stay `PAID`; forgot still 200s. This is **event-driven** (user clicked), not cron (clock). Render free sleeps; UptimeRobot on `/ready` keeps the in-process worker awake.
 
 **`order-confirmation`** — added only when `capturePayment` actually writes `PAID`. Payload `{ orderId }`. Worker skips if the order is missing or not `PAID`.
 
@@ -2410,7 +3115,7 @@ OTP email is **not** a job (Week 1–3 path). Same queue could take a third name
 | Winston | `src/config/logger.js` — JSON files + color console when `NODE_ENV !== production` |
 | `logs/error.log` | `error` level only |
 | `logs/combined.log` | everything including `http` |
-| Morgan | `dev` locally, `combined` in production; `skip` `/health`; `stream.write` → `logger.http` |
+| Morgan | `dev` locally, `combined` in production; `skip` `/health` and `/ready`; `stream.write` → `logger.http` |
 | Worker | `logger.info` / `logger.error` for starting, completed, failed, queue error |
 
 `level` is `debug` in development and `http` in production (`info` would drop Morgan lines — `http` is a lower npm level).
@@ -2613,11 +3318,11 @@ In development mode, responses also include:
 ## ⚙️ Setup Instructions
 
 ### Prerequisites
-- Node.js v18+
-- PostgreSQL 14+
-- MongoDB 6+
-- Redis (Memurai on Windows works as a drop-in)
-- npm or yarn
+- Node.js **20.x** (`package.json` `engines`)
+- PostgreSQL 14+ (or Docker / Neon)
+- MongoDB 6+ (or Docker / Atlas)
+- Redis (Memurai, Docker, or Upstash `rediss://`)
+- npm
 - A Gmail account with 2-Step Verification and an **App Password** (normal Gmail password will get `535 BadCredentials`)
 - Razorpay **test** account (optional until you hit checkout). Webhooks locally: `npx ngrok http 3000`
 
@@ -2653,22 +3358,23 @@ npm run seed
 ```
 
 ### 7. Start Redis
-Memurai (Windows) or `redis-server` must be running on `localhost:6379` before `npm run dev`. Cart, OTP, reset tokens, blacklist, rate limits, cache, **and Bull** all need it. `server.js` connects Redis **before** loading Express so the rate-limit store is not created against a closed client.
+Memurai (Windows) or `redis-server` on `localhost:6379`, or skip this and use Compose. Set `REDIS_URL=redis://127.0.0.1:6379`. `server.js` connects Redis **before** loading Express so the rate-limit store is not created against a closed client.
 
-### 8. Start the API **and** the worker
-Two terminals whenever you test mail:
-
-```bash
-npm run dev          # HTTP (Helmet, CORS, Morgan)
-npm run worker       # Bull consumers — prints "Email worker starting"
-```
+### 8. Start the API
+With `RUN_WORKER_IN_PROCESS=true` in `.env`, one process is enough:
 
 ```bash
-npm start            # Production API
-npm run worker       # Production worker (leave it up 24/7 with the API)
+npm run dev          # HTTP + email worker
 ```
 
-Without the worker, jobs wait in Redis; forgot still 200s and paid orders stay `PAID`, but no mail goes out.
+Mail-only second process (API must have `RUN_WORKER_IN_PROCESS=false`):
+
+```bash
+npm start
+npm run worker
+```
+
+Without a consumer, jobs wait in Redis; forgot still 200s and paid orders stay `PAID`, but no mail goes out.
 
 ### .env.example
 ```env
@@ -2703,9 +3409,11 @@ BASE_URL=http://localhost:3000
 # Browser origins allowed to call this API (comma-separated)
 CORS_ORIGINS=http://localhost:3000,http://localhost:5173
 
-# Optional — Bull ioredis (defaults 127.0.0.1:6379)
-# REDIS_HOST=127.0.0.1
-# REDIS_PORT=6379
+# Redis (cart, rate limit, Bull). Upstash: rediss://...
+REDIS_URL=redis://127.0.0.1:6379
+
+# true = worker inside the API (local / Compose / Render free)
+RUN_WORKER_IN_PROCESS=true
 
 # Razorpay (test keys — never commit secrets)
 RAZORPAY_KEY_ID=rzp_test_xxx
@@ -2718,11 +3426,64 @@ Generate secure secrets:
 node -e "console.log(require('crypto').randomBytes(64).toString('hex'))"
 ```
 
+Missing names listed in `src/config/env.js` make the process **exit on boot**.
+
+---
+
+## 🐳 Docker
+
+From the repo root (Docker Desktop engine running):
+
+```bash
+docker compose up --build
+```
+
+Compose starts Postgres 16, Mongo 7, Redis 7, and the API. The API command is `npx prisma migrate deploy && node server.js`. With `RUN_WORKER_IN_PROCESS=true` there is **no** second worker container.
+
+```bash
+docker compose exec api npm run seed
+```
+
+Hit `http://localhost:3000/health`. `docker compose down` stops containers; named volumes keep data.
+
+---
+
+## 🚀 Deploy (Render)
+
+Live: [https://e-commerce-backend-iea3.onrender.com](https://e-commerce-backend-iea3.onrender.com)
+
+Do **not** deploy `docker-compose.yml`. Render runs **one Node web service**.
+
+| Setting | Value |
+|---|---|
+| Runtime | Node 20 |
+| Build | `npm install && npx prisma generate` |
+| Start | `npx prisma migrate deploy && npm start` |
+| Health check | `/health` |
+| Dev dependencies | On (`prisma` CLI is a devDependency) |
+
+Hosted stores: Neon (pooled `DATABASE_URL`), Atlas (`MONGODB_URI`), Upstash (`REDIS_URL` as `rediss://...`). Also set `NODE_ENV=production`, `RUN_WORKER_IN_PROCESS=true`, `BASE_URL` and `CORS_ORIGINS` to `https://e-commerce-backend-iea3.onrender.com` (no trailing slash). Leave `PORT` unset.
+
+Razorpay webhook: `https://e-commerce-backend-iea3.onrender.com/payments/webhook` (secret = `RAZORPAY_WEBHOOK_SECRET`; events `payment.captured`, `refund.processed`).
+
+**UptimeRobot:** HTTP(s) monitor, 5 minutes, `https://e-commerce-backend-iea3.onrender.com/ready`. Free Render sleeps after ~15 minutes idle; this ping keeps the process (and in-process worker) up.
+
+Redis on Upstash: ping every 30s, reconnect, IPv4, 10s connect timeout; listen on `0.0.0.0`.
+
 ---
 
 ## 🧪 API Testing
 
+- Swagger UI: [http://localhost:3000/api-docs](http://localhost:3000/api-docs) or [production `/api-docs`](https://e-commerce-backend-iea3.onrender.com/api-docs)
+- Postman: import `docs/postman/ecommerce.postman_collection.json`; set `{{baseUrl}}` and login to fill `{{accessToken}}`
+
 ### cURL Examples
+
+**Health / ready:**
+```bash
+curl http://localhost:3000/health
+curl http://localhost:3000/ready
+```
 
 **Register:**
 ```bash
@@ -2868,7 +3629,9 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 
 ## 🧠 What I Learned
 
-### Week 1 — Auth & PostgreSQL
+<a id="auth-postgresql"></a>
+<details>
+<summary>Auth & PostgreSQL</summary>
 
 **Engineering Concepts:**
 - **Layered architecture** — Why separating routes, controllers, and services makes code reusable across HTTP, CLI, and background jobs
@@ -2882,7 +3645,11 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 - **URL encoding in connection strings** — Special characters in PostgreSQL passwords must be percent-encoded
 - **bcrypt comparison misconception** — bcrypt uses a random salt per hash, making re-hashing impossible — `bcrypt.compare()` is the only correct approach
 
-### Week 2 — MongoDB Product Catalog
+</details>
+
+<a id="mongodb-product-catalog"></a>
+<details>
+<summary>MongoDB Product Catalog</summary>
 
 **Engineering Concepts:**
 - **SQL vs NoSQL tradeoffs** — Evaluated based on data shape and relationships, not popularity. Products have variable attributes that would require sparse columns or an EAV pattern in SQL
@@ -2899,7 +3666,11 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 - **ObjectId vs string comparison** — Query params arrive as strings, but MongoDB stores ObjectIds. `$in: [category]` never matched until explicitly wrapping with `new mongoose.Types.ObjectId(category)`
 - **Mongoose 7+ async hook syntax** — Pre-save hooks require an `async function()` with no `next` parameter; the older callback style produced a confusing "next is not a function" error
 
-### Week 3 — Redis: Cart, OTP, Blacklist, Rate Limits
+</details>
+
+<a id="redis-cart-otp-blacklist-rate-limits"></a>
+<details>
+<summary>Redis: Cart, OTP, Blacklist, Rate Limits</summary>
 
 **Engineering Concepts:**
 - **Right store for the job** — Cart is intent (Redis hash + TTL). Price and name stay in Mongo. Money will stay in Postgres. Redis here is not a product cache
@@ -2919,7 +3690,11 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 - **Rate-limit store before Redis connect** — Requiring `app` (which loads `rateLimit.js`) before `connectRedis()` threw `ClientClosedError`. `server.js` now connects first, then `require('./src/app')`
 - **ERR_ERL_KEY_GEN_IPV6** — Custom `keyGenerator: (req) => req.ip` is rejected. IP-only limiters use the library default; email/userId keep a custom generator
 
-### Week 4 — Response Cache, Invalidation, Stampede Lock
+</details>
+
+<a id="response-cache-invalidation-stampede-lock"></a>
+<details>
+<summary>Response Cache, Invalidation, Stampede Lock</summary>
 
 **Engineering Concepts:**
 - **Cache-aside** — Redis holds a copy of the GET JSON, not the catalog. Mongo stays source of truth. Miss → Mongo → `setEx`
@@ -2938,7 +3713,11 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 - **SCAN infinite loop** — Redis returns cursor `"0"`. `!== 0` is always true for the string `"0"`. Loop until `cursor !== '0'`
 - **Stale product list after category rename** — product GET populates category name. Category writes must also `invalidateCache('cache:/products')`
 
-### Week 5 — Addresses, Orders, Razorpay
+</details>
+
+<a id="addresses-orders-razorpay"></a>
+<details>
+<summary>Addresses, Orders, Razorpay</summary>
 
 **Engineering Concepts:**
 - **Cart vs order** — Redis may expire; a bill cannot. Postgres stores Order + OrderItem + Payment. Redis cart is copied then deleted
@@ -2969,7 +3748,11 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 - **`order.userId !== orderId`** — compared user uuid to order uuid; 403 on your own order. Compare to `userId`
 - **PUT `isDefault: false` on the default** — left zero defaults until promote-another was added (same idea as delete-default)
 
-### Week 6 — Jobs, Helmet, CORS, Zod leftovers, Cursor, Logs
+</details>
+
+<a id="jobs-helmet-cors-zod-leftovers-cursor-logs"></a>
+<details>
+<summary>Jobs, Helmet, CORS, Zod leftovers, Cursor, Logs</summary>
 
 **Engineering Concepts:**
 - **Jobs vs request** — slow/flaky work (`sendMail`) is `emailQueue.add` + a worker. HTTP stays fast. Redis holds the list if either process restarts
@@ -2993,9 +3776,33 @@ Webhook is sent by Razorpay to `https://<ngrok>/payments/webhook`, not by curl (
 - **`resetPasswordSchema` used without import** when parsing in the controller
 - **`logger.error` after development `return`** — 400s never hit `logs/error.log`. Log first
 - **Winston `simple()` extra `{"timestamp"}`** — logger format adds timestamp; console `simple()` prints leftover keys. Cosmetic
-- **OTP still sync** — left on purpose (built before the queue); not a third job this week
+- **OTP still sync** — left on purpose (built before the queue); not a third job
+
+</details>
+
+<a id="docker-env-docs-render"></a>
+<details>
+<summary>Docker, env, docs, Render</summary>
+
+**Engineering Concepts:**
+- **Compose vs production** — Compose is five local containers. Render free is one Node process plus hosted Neon, Atlas, and Upstash. The `Dockerfile` is optional packaging; Compose is not a free Render stack
+- **Required env** — missing `DATABASE_URL` / `REDIS_URL` / JWT / mail must exit at boot, not fail on the first request
+- **In-process worker on free** — one process; `RUN_WORKER_IN_PROCESS` is the switch for a later dedicated worker
+- **`REDIS_URL`** — TLS and password live in the URL; host/port env vars cannot talk to Upstash
+- **`trust proxy` + bind `0.0.0.0`** — real IPs/HTTPS; Render’s port scan sees the listener
+- **`/health` vs `/ready`** — platform liveness vs store pings for UptimeRobot
+- **OpenAPI matches code** — Swagger/Postman document implemented routes only
+
+**Challenges Faced:**
+- **Prisma generate in Docker** — `prisma generate` needs a dummy `DATABASE_URL` at image build
+- **Seed with empty Mongo** — seed now inserts categories if none exist
+- **Upstash `SocketClosedUnexpectedlyError`** — idle TCP drop; ping + `error` listener (no throw) + reconnect
+- **Render “No open ports”** — `listen()` waited on Redis; Mongo logged, Redis hung. Connect timeout, IPv4, then bind `0.0.0.0`
+- **Node 24 on Render** — pin `engines.node` to `20.x`
 
 ---
+
+</details>
 
 ## 🤝 Contributing
 
@@ -3010,3 +3817,4 @@ MIT License — free to use for personal and commercial projects.
 ---
 
 <p align="center">Built from scratch as a learning project — no boilerplate, no AI-generated code, every line understood.</p>
+
